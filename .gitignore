@@ -1,0 +1,10 @@
+# Vendor binaries are fetched, never committed
+/blobs/
+*.ko
+*.o
+*.o_shipped
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order

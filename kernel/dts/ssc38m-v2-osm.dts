@@ -1,0 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * SSC_38M_2.0 with the nodes of the SigmaStar vendor video modules.
+ * The board DTS comes from the mainline tree (KDIR source).
+ */
+#include "sigmastar/mstar-infinity6e-ssc338q-ssc38m-v2.dts"
+#include "sstar-video.dtsi"
+#include "osm-compat.dtsi"

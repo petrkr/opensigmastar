@@ -8,6 +8,10 @@ BLOBS := mhal mi_common mi_sys mi_rgn mi_ldc mi_ai mi_ao mi_mipitx mi_sensor \
 BLOB_NAMES := $(notdir $(BLOBS))
 PYTHON ?= python3
 
+# Kernel source and build tree for the board DTS (dtc from the build tree)
+KSRC ?= $(KDIR)/source
+DTC ?= $(KDIR)/scripts/dtc/dtc
+DTB := kernel/dts/ssc38m-v2-osm.dtb
 
 all: modules
 
@@ -20,9 +24,15 @@ relink:
 modules: relink
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel OSM_BLOBS="$(BLOB_NAMES)" modules
 
+dtb: $(DTB)
+
+$(DTB): kernel/dts/ssc38m-v2-osm.dts kernel/dts/sstar-video.dtsi kernel/dts/osm-compat.dtsi
+	cpp -nostdinc -undef -D__DTS__ -x assembler-with-cpp \
+		-I $(KSRC)/include -I $(KSRC)/arch/arm/boot/dts -I kernel/dts \
+		$< | $(DTC) -q -I dts -O dtb -o $@ -
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel clean
-	rm -f kernel/blobs/*_blob.o_shipped kernel/blobs/*_wrap.c
+	rm -f kernel/blobs/*_blob.o_shipped kernel/blobs/*_wrap.c $(DTB)
 
-.PHONY: all relink modules clean
+.PHONY: all relink modules dtb clean

@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Properties that only the osm compat code needs. The vendor DT does not
+ * have them, so they are kept out of sstar-video.dtsi (which mirrors the
+ * vendor nodes the blobs look up).
+ */
+#include <dt-bindings/clock/sstar,ssc338q-clkgen.h>
+
+/* FCLK1 (SCL/GOP) from mpll 345 MHz, applied by osm_chip_init() */
+&vpe {
+	assigned-clocks = <&clkgen SSC338Q_CLKGEN_FCLK1>;
+	assigned-clock-parents = <&mpll_345m>;
+};

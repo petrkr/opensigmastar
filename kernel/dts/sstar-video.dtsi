@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Device tree nodes looked up by the SigmaStar vendor modules (mhal), from
+ * the BSP infinity6e.dtsi, mapped to the mainline DT: registers as &riu
+ * offsets, interrupts on intc_irq (vendor INT_IRQ - 32), clocks from the
+ * mainline clkgen where it has them, fixed-clock placeholders otherwise.
+ * Board values (CSI lanes, VIF pads, sensorif I2C, audio) are those of the
+ * vendor ssc012b-s01a board and still have to be checked for SSC38M.
+ */
+#include <dt-bindings/clock/sstar,ssc338q-clkgen.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+&clocks {
+	/* TODO: real clkgen gates/muxes missing in mainline; placeholders so of_clk_get() succeeds */
+	clk_isp:    clk-isp    { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <384000000>; }; /* TODO rate */
+	clk_fclk1:  clk-fclk1  { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <432000000>; }; /* TODO */
+	clk_odclk:  clk-odclk  { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <216000000>; }; /* TODO */
+	clk_gop0:   clk-gop0   { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <432000000>; }; /* TODO */
+};
+
+&riu {
+	/* all nodes need status okay + must become platform devices (of_find_device_by_node) */
+
+	isp: isp@0 { /* TODO unit address; node name must not clash, or use isp-vendor */
+		compatible = "isp";
+		io_phy_addr = <0x1f000000>;
+		banks = <0x1302>;
+		interrupts-extended = <&intc_irq GIC_SPI 25 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_isp>;
+		clock-frequency-index = <0>;
+		status = "okay";
+	};
+
+	ispmid { compatible = "sstar,ispmid"; status = "okay"; };
+	ispalgo { compatible = "sstar,ispalgo"; status = "okay"; };   /* not used by mhal */
+
+	vif {
+		compatible = "sstar,vif";
+		interrupts-extended = <&intc_irq GIC_SPI 57 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkgen SSC338Q_CLKGEN_SR00_MCLK>, <&clkgen SSC338Q_CLKGEN_SR1_MCLK>, <&clkgen SSC338Q_CLKGEN_SR01_MCLK>;
+		vif_sr0_mclk_37p125 = <1>; vif_sr1_mclk_37p125 = <1>; vif_sr2_mclk_37p125 = <1>;
+		/* TODO board/sensor pad modes: copied from vendor ssc012b-s01a (mipi0 4-lane); verify vs SSC38M sensor */
+		vif_sr0_par_mode = <0>; vif_sr0_mipi_mode = <1>; vif_sr0_bt656_mode = <0>; vif_sr0_mclk_mode = <0>;
+		vif_sr0_parallel_rst_mode = <0>; vif_sr0_parallel_pdn_mode = <0>;
+		vif_sr0_mipi_rst_mode = <0>; vif_sr0_mipi_pdn_mode = <1>; vif_sr0_mipi_ctrl_mode = <1>;
+		vif_sr1_par_mode = <0>; vif_sr1_mipi_mode = <1>; vif_sr1_bt656_mode = <0>;
+		vif_sr1_mipi_ctrl_mode = <1>; vif_sr1_mclk_mode = <0>; vif_sr1_rst_mode = <0>;
+		vif_sr2_mipi_mode = <0>; vif_sr2_mipi_ctrl_mode = <0>; vif_sr2_mclk_mode = <0>; vif_sr2_rst_mode = <0>;
+		status = "okay";
+	};
+
+	csi {
+		compatible = "sstar,csi";
+		io_phy_addr = <0x1f000000>;
+		banks = <0x120b>, <0x120c>, <0x120d>, <0x1208>, <0x1209>, <0x120a>, <0x1202>, <0x1203>, <0x1204>, <0x1038>, <0x120e>;
+		interrupts-extended = <&intc_irq GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkgen SSC338Q_CLKGEN_CSI_LPTX_M00>, <&clkgen SSC338Q_CLKGEN_CSI_MAC_M00>, <&clkgen SSC338Q_CLKGEN_NS_M00>,
+			 <&clkgen SSC338Q_CLKGEN_CSI_LPTX_M1>,  <&clkgen SSC338Q_CLKGEN_CSI_MAC_M1>,  <&clkgen SSC338Q_CLKGEN_NS_M1>,
+			 <&clkgen SSC338Q_CLKGEN_CSI_LPTX_M01>, <&clkgen SSC338Q_CLKGEN_CSI_MAC_M01>, <&clkgen SSC338Q_CLKGEN_NS_M01>;
+		csi_sr0_lane_num = <4>; csi_sr1_lane_num = <4>; csi_sr2_lane_num = <2>;
+		csi_sr0_lane_select = <2 4 3 1 0>; csi_sr1_lane_select = <0 0 0 0 0>; csi_sr2_lane_select = <0 0 0>; /* TODO board */
+		csi_sr0_lane_pn_swap = <1 1 1 1 1>; csi_sr1_lane_pn_swap = <0 0 0 0 0>; csi_sr2_lane_pn_swap = <0 0 0>; /* TODO board */
+		status = "okay";
+	};
+
+	sensorif {
+		compatible = "sstar,sensorif";
+		sensorif_grp0_i2c = <1>; sensorif_grp1_i2c = <2>; sensorif_grp2_i2c = <1>;  /* TODO: map to our i2c bus ids */
+		status = "okay";
+	};
+
+	vpe: vpe@242000 {
+		compatible = "sigmastar,vpe";
+		reg = <0x242000 0x100>;
+		interrupts-extended = <&intc_irq GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>,
+				      <&intc_irq GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_fclk1>, <&clk_odclk>;
+		clock-names = "CLK_fclk1", "CLK_fclk2", "CLK_odclk"; /* vendor has 3 names for 2 clocks; TODO */
+		clk-select = <2>;
+		status = "okay";
+	};
+	scl { compatible = "sstar,scl"; status = "okay"; };   /* not looked up by mhal */
+
+	dip {
+		compatible = "sstar,dip";
+		interrupts-extended = <&intc_irq GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkgen SSC338Q_CLKGEN_DIP>;
+		status = "okay";
+	};
+
+	ldc@287800 {
+		compatible = "sstar,ldc";
+		reg = <0x287800 0x100>, <0x287a00 0x100>;
+		interrupts-extended = <&intc_irq GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkgen SSC338Q_CLKGEN_LDC>;  /* TODO: ldcfeye == LDC? */
+		clock-names = "CLK_ldcfeye";
+		clk-select = <1>;
+		status = "okay";
+	};
+
+	gop {
+		compatible = "sigmastar,gop";
+		clocks = <&clk_gop0>, <&clk_fclk1>, <&clkgen SSC338Q_CLKGEN_DIP>, <&clkgen SSC338Q_CLKGEN_LDC>;
+		status = "okay";
+	};
+
+	venc@345200 {
+		compatible = "sstar,venc";
+		reg = <0x345200 0x800>, <0x2c5200 0x100>, <0x203c00 0x100>, <0x207800 0x100>;
+		reg-names = "vpu-bit", "venc-brige", "hw-uart0", "hw-uart1";
+		interrupts-extended = <&intc_irq GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "mhe-irq";
+		clocks = <&clkgen SSC338Q_CLKGEN_VHE>, <&clkgen SSC338Q_CLKGEN_MFE>;
+		clock-names = "CKG_venc"; /* as vendor (2 clocks, 1 name) */
+		status = "okay";
+	};
+
+	jpe@2c4000 {
+		compatible = "sstar,cedric-jpe";
+		reg = <0x2c4000 0x100>;
+		interrupts-extended = <&intc_irq GIC_SPI 29 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkgen SSC338Q_CLKGEN_JPE>;
+		clock-names = "CKG_jpe";
+		clk-select = <0>;
+		status = "okay";
+	};
+
+	cmdq0 { compatible = "sstar,cmdq0"; clocks = <&clkgen SSC338Q_CLKGEN_MCU>; interrupts-extended = <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>; status = "okay"; };
+	cmdq1 { compatible = "sstar,cmdq1"; clocks = <&clkgen SSC338Q_CLKGEN_MCU>; interrupts-extended = <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>; status = "okay"; };
+	cmdq2 { compatible = "sstar,cmdq2"; clocks = <&clkgen SSC338Q_CLKGEN_MCU>; interrupts-extended = <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>; status = "okay"; };
+	cmdq3 { compatible = "sstar,cmdq3"; clocks = <&clkgen SSC338Q_CLKGEN_MCU>; interrupts-extended = <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>; status = "okay"; };
+
+	pnl {
+		compatible = "sstar,pnl";
+		ttl-24bit-mode = <0>; ttl-16bit-mode = <1>; jtag-mode = <1>;
+		clocks = <&clk_odclk>; clock-names = "CLK_odclk";
+		interrupts-extended = <&intc_irq GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>;
+		status = "okay";
+	};
+	disp {
+		compatible = "sstar,disp";
+		clocks = <&clk_odclk>; clock-names = "CLK_odclk";
+		interrupts-extended = <&intc_irq GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>,
+				      <&intc_irq GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>;
+		status = "okay";
+	};
+	mipitx {
+		compatible = "sstar,mipitx";
+		clocks = <&clkgen SSC338Q_CLKGEN_MIPI1_TX_CSI>; clock-names = "CLK_mipi1_tx_csi";
+		interrupts-extended = <&intc_irq GIC_SPI 54 IRQ_TYPE_LEVEL_HIGH>;
+		status = "okay";
+	};
+
+	sound {
+		compatible = "sstar,audio";
+		interrupts-extended = <&intc_irq GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
+		amp-gpio = <0xffff 1>; /* vendor PAD_UNKNOWN (=none); our amp is PM_GPIO3 handled elsewhere */
+		clocks = <&clkgen SSC338Q_CLKGEN_BACH>;
+		digmic-padmux = <6>; i2s-trx-shared-padmux = <5>; i2s-tx-padmux = <0>; i2s-rx-padmux = <0>;
+		i2smck-padmux = <1>; i2smod-padmux = <0>; keep-i2s-clk = <0>;   /* TODO padmux values for board */
+		i2s-rx-tdm-ws-pgm = <0>; i2s-rx-tdm-ws-width = <0>; i2s-rx-tdm-ch-swap = <0 0>;
+		i2s-tx-tdm-ws-pgm = <0>; i2s-tx-tdm-ws-width = <0>; i2s-tx-tdm-ch-swap = <0 0>; i2s-tx-tdm-active-slot = <0x03>;
+		dmic-bck-mode = <0>; keep_adc_power_on = <0>; keep_dac_power_on = <0>;
+		status = "okay";
+	};
+};

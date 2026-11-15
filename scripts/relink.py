@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""Relink a vendor Linux 4.9 module into an object for the current kernel.
+
+The vendor module is turned into ``<name>_blob.o_shipped``:
+
+- ``.gnu.linkonce.this_module``, ``.modinfo``, ``__versions`` and
+  ``__ksymtab*`` are removed (the wrapper provides the current layouts),
+  ``__this_module`` becomes undefined so ``__param`` resolves to the
+  wrapper's module
+- ``init_module``/``cleanup_module`` are renamed to
+  ``osm_<name>_blob_init``/``osm_<name>_blob_exit``
+- kernel symbols are renamed to compat symbols (``--redefine-syms``)
+- ``.init.text``/``.exit.text`` become ``.text.osm.init``/``.text.osm.exit``,
+  the vendor code calls them after init
+- Thumb-2 phys-to-virt stubs (``.pv_table``) are patched with a fixed
+  offset, the current kernel patches a different instruction sequence
+
+``<name>_wrap.c`` is generated next to it: module init/exit calling the
+blob through the compat entry helpers, and the exports of the blob.
+"""
+
+import argparse
+import os
+import struct
+import subprocess
+import sys
+
+SHN_UNDEF = 0
+SHT_SYMTAB = 2
+SHT_REL = 9
+
+REMOVE = ('.gnu.linkonce.this_module', '.modinfo', '__versions',
+          '__ksymtab', '__ksymtab_gpl', '__ksymtab_strings', '.pv_table')
+
+
+class Elf:
+    def __init__(self, data):
+        self.data = bytearray(data)
+        if self.data[:4] != b'\x7fELF' or self.data[4] != 1 or self.data[5] != 1:
+            sys.exit('not an ELF32 little endian object')
+        (self.shoff,) = struct.unpack_from('<I', self.data, 0x20)
+        self.shentsize, self.shnum, self.shstrndx = struct.unpack_from('<HHH', self.data, 0x2e)
+        self.sh = [struct.unpack_from('<10I', self.data, self.shoff + i * self.shentsize)
+                   for i in range(self.shnum)]
+        strtab = self.sh[self.shstrndx]
+        self.names = [self.cstr(strtab[4] + s[0]) for s in self.sh]
+
+    def cstr(self, off):
+        return self.data[off:self.data.index(b'\0', off)].decode()
+
+    def section(self, name):
+        if name not in self.names:
+            return None, None
+        i = self.names.index(name)
+        return i, self.sh[i]
+
+    def body(self, name):
+        _, s = self.section(name)
+        return None if s is None else bytes(self.data[s[4]:s[4] + s[5]])
+
+    def symbols(self):
+        """Yield (file offset of the entry, name, value, size, info, shndx)."""
+        for s in self.sh:
+            if s[1] != SHT_SYMTAB:
+                continue
+            strtab = self.sh[s[6]]
+            for off in range(s[4], s[4] + s[5], 16):
+                n, v, sz, info, oth, ndx = struct.unpack_from('<IIIBBH', self.data, off)
+                yield off, self.cstr(strtab[4] + n), v, sz, info, ndx
+
+    def undefine(self, name):
+        for off, n, _, _, info, ndx in self.symbols():
+            if n == name and ndx != SHN_UNDEF:
+                # global, no type, undefined
+                struct.pack_into('<IIBBH', self.data, off + 4, 0, 0, 0x10, 0, SHN_UNDEF)
+                return True
+        return False
+
+
+def thumb_modimm(value):
+    """Encode a Thumb-2 modified immediate (rotated 8 bit forms only)."""
+    for rot in range(8, 32):
+        imm8 = ((value << rot) | (value >> (32 - rot))) & 0xffffffff
+        if imm8 < 0x100 and imm8 & 0x80:
+            return rot << 7 | (imm8 & 0x7f)
+    sys.exit('pv offset 0x%08x is not encodable' % value)
+
+
+def patch_pv(elf, pv_offset):
+    """Patch the 4.9 Thumb-2 'add/sub.w rd, rn, #0x81000000' stubs."""
+    table = elf.body('.pv_table')
+    if table is None:
+        return 0
+    _, rel = elf.section('.rel.pv_table')
+    _, text = elf.section('.text')
+    symtab = list(elf.symbols())
+    for i in range(0, len(table), 4):
+        (addend,) = struct.unpack_from('<I', table, i)
+        r_off, r_info = struct.unpack_from('<II', elf.data, rel[4] + (i // 4) * 8)
+        if r_off != i or symtab[r_info >> 8][1] != '' or symtab[r_info >> 8][5] != elf.names.index('.text'):
+            sys.exit('unexpected .pv_table relocation at %d' % i)
+        insn = text[4] + addend
+        hw1, hw2 = struct.unpack_from('<HH', elf.data, insn)
+        if hw1 & 0xfa00 != 0xf000 or hw2 & 0x8000:
+            sys.exit('unexpected pv stub 0x%04x 0x%04x at .text+0x%x' % (hw1, hw2, addend))
+        enc = thumb_modimm(0x81000000)
+        if (hw1 >> 10 & 1) << 11 | (hw2 >> 12 & 7) << 8 | (hw2 & 0xff) != enc:
+            sys.exit('pv stub at .text+0x%x is not #0x81000000' % addend)
+        enc = thumb_modimm(pv_offset)
+        hw1 = hw1 & ~0x0400 | (enc >> 11 & 1) << 10
+        hw2 = hw2 & ~0x70ff | (enc >> 8 & 7) << 12 | (enc & 0xff)
+        struct.pack_into('<HH', elf.data, insn, hw1, hw2)
+    return len(table) // 4
+
+
+def ksyms(elf):
+    strings = elf.body('__ksymtab_strings') or b''
+    return sorted({s.decode() for s in strings.split(b'\0') if s})
+
+
+WRAP = '''\
+// SPDX-License-Identifier: GPL-2.0
+/* Generated by scripts/relink.py from {src}, do not edit. */
+#include <linux/module.h>
+#include "osm_compat.h"
+
+int osm_{name}_blob_init(void);
+{exit_decl}
+static int __init osm_{name}_init(void)
+{{
+	struct osm_entry e;
+	int ret;
+
+	osm_enter(&e);
+	ret = osm_{name}_blob_init();
+	osm_leave(&e);
+	return ret;
+}}
+module_init(osm_{name}_init);
+{exit_def}
+{exports}
+MODULE_LICENSE("{license}");
+MODULE_DESCRIPTION("{desc}");
+'''
+
+EXIT = '''
+static void __exit osm_{name}_exit(void)
+{{
+	struct osm_entry e;
+
+	osm_enter(&e);
+	osm_{name}_blob_exit();
+	osm_leave(&e);
+}}
+module_exit(osm_{name}_exit);
+'''
+
+
+def modinfo(elf, key):
+    for s in (elf.body('.modinfo') or b'').split(b'\0'):
+        if s.startswith(key.encode() + b'='):
+            return s.split(b'=', 1)[1].decode()
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('ko', help='vendor 4.9 module')
+    ap.add_argument('name', help='module name')
+    ap.add_argument('outdir')
+    ap.add_argument('--map', help='objcopy --redefine-syms file')
+    ap.add_argument('--pv-offset', type=lambda x: int(x, 0), default=0x60000000,
+                    help='PHYS_OFFSET - PAGE_OFFSET (default %(default)#x)')
+    ap.add_argument('--symvers', help='kernel Module.symvers, its exports are not re-exported')
+    ap.add_argument('--objcopy', default=os.environ.get('CROSS_COMPILE', '') + 'objcopy')
+    a = ap.parse_args()
+
+    elf = Elf(open(a.ko, 'rb').read())
+    if a.pv_offset & 0xffffff:
+        sys.exit('pv offset must be a multiple of 16 MiB')
+    npv = patch_pv(elf, a.pv_offset)
+    exports = ksyms(elf)
+    if a.symvers:
+        kernel = {l.split('\t')[1] for l in open(a.symvers)}
+        exports = [s for s in exports if s not in kernel]
+    names = {s[1] for s in elf.symbols() if s[5] != SHN_UNDEF}
+    if 'init_module' not in names:
+        sys.exit('no init_module in %s' % a.ko)
+    has_exit = 'cleanup_module' in names
+    elf.undefine('__this_module')
+    license = modinfo(elf, 'license') or 'Proprietary'
+    desc = modinfo(elf, 'description') or '%s (vendor module)' % a.name
+
+    os.makedirs(a.outdir, exist_ok=True)
+    tmp = os.path.join(a.outdir, a.name + '_blob.tmp')
+    out = os.path.join(a.outdir, a.name + '_blob.o_shipped')
+    open(tmp, 'wb').write(elf.data)
+    cmd = [a.objcopy]
+    for sec in REMOVE:
+        if sec in elf.names:
+            cmd += ['--remove-section', sec]
+        if '.rel' + sec in elf.names:
+            cmd += ['--remove-section', '.rel' + sec]
+    # The vendor code calls init/exit code after init (camdriver_init),
+    # keep it resident
+    for sec in ('.init.text', '.exit.text'):
+        for pre in ('', '.ARM.exidx'):
+            if pre + sec in elf.names:
+                cmd += ['--rename-section', '%s%s=%s.text.osm%s' % (pre, sec, pre, sec[:5])]
+    cmd += ['--redefine-sym', 'init_module=osm_%s_blob_init' % a.name]
+    if has_exit:
+        cmd += ['--redefine-sym', 'cleanup_module=osm_%s_blob_exit' % a.name]
+    if a.map:
+        # objcopy does not take blank lines, keep only the pairs
+        pairs = [l.split('#')[0].split() for l in open(a.map)]
+        with open(tmp + '.map', 'w') as f:
+            f.write(''.join('%s %s\n' % tuple(p) for p in pairs if p))
+        cmd += ['--redefine-syms', tmp + '.map']
+    subprocess.run(cmd + [tmp, out], check=True)
+    os.unlink(tmp)
+    if a.map:
+        os.unlink(tmp + '.map')
+
+    with open(os.path.join(a.outdir, a.name + '_wrap.c'), 'w') as f:
+        f.write(WRAP.format(
+            src=os.path.basename(a.ko), name=a.name, license=license, desc=desc,
+            exit_decl='void osm_%s_blob_exit(void);\n' % a.name if has_exit else '',
+            exit_def=EXIT.format(name=a.name) if has_exit else '',
+            exports=''.join('extern char %s[];\nEXPORT_SYMBOL(%s);\n' % (s, s)
+                            for s in exports)))
+    print('%s: %d exports, %d pv stubs, exit %s' % (a.name, len(exports), npv,
+                                                     'yes' if has_exit else 'no'))
+
+
+if __name__ == '__main__':
+    main()

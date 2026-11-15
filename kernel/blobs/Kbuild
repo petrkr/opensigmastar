@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0
+# Vendor modules relinked by scripts/relink.py (make relink)
+ccflags-y += -I$(src)/../compat
+
+define osm_blob
+obj-m += $(1).o
+$(1)-y := $(1)_wrap.o $(1)_blob.o
+endef
+
+OSM_BLOBS ?= mhal mi_common mi_sys
+$(foreach b,$(OSM_BLOBS),$(eval $(call osm_blob,$(b))))

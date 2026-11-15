@@ -8,3 +8,4 @@
 *.cmd
 Module.symvers
 modules.order
+*_wrap.c

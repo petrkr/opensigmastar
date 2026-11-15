@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m += osm_compat.o
+osm_compat-y := entry.o shims.o ldivmod.o locks.o fops.o mm.o vma.o file.o

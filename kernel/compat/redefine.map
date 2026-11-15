@@ -1,0 +1,81 @@
+# objcopy --redefine-syms map for the vendor modules: 4.9 symbol, then
+# the current kernel symbol or the osm_* shim in kernel/compat.
+# Shims that do not exist yet show up as unresolved symbols in modpost.
+
+# Renamed in the current kernel, same ABI
+printk				_printk
+vmalloc				vmalloc_noprof
+
+# Removed, inlined or changed signature
+__aeabi_ldivmod			osm___aeabi_ldivmod
+__aeabi_uldivmod		osm___aeabi_uldivmod
+_raw_spin_unlock		osm__raw_spin_unlock
+getnstimeofday64		osm_getnstimeofday64
+jiffies_to_msecs		osm_jiffies_to_msecs
+show_stack			osm_show_stack
+strncpy				osm_strncpy
+usleep_range			osm_usleep_range
+warn_slowpath_null		osm_warn_slowpath_null
+
+# gfp_t values differ from 4.9
+__alloc_pages_nodemask		osm___alloc_pages_nodemask
+__kmalloc			osm___kmalloc
+kmem_cache_alloc		osm_kmem_cache_alloc
+kmem_cache_free			osm_kmem_cache_free
+kmalloc_caches			osm_kmalloc_caches
+kmemdup				osm_kmemdup
+kstrdup				osm_kstrdup
+sg_alloc_table			osm_sg_alloc_table
+
+# 4.9 has DEBUG_SPINLOCK: larger wait queue heads and semaphores (locks.c)
+__init_waitqueue_head		osm___init_waitqueue_head
+__wake_up			osm___wake_up
+prepare_to_wait_event		osm_prepare_to_wait_event
+finish_wait			osm_finish_wait
+wait_for_completion_timeout	osm_wait_for_completion_timeout
+down				osm_down
+up				osm_up
+
+# 4.9 file, inode and seq_file (fops.c)
+seq_read			osm_seq_read
+seq_lseek			osm_seq_lseek
+single_release			osm_single_release
+
+# struct mutex layout differs from 4.9
+__mutex_init			osm___mutex_init
+mutex_lock			osm_mutex_lock
+mutex_unlock			osm_mutex_unlock
+
+# TODO: struct layouts of 4.9 (timer_list, delayed_work, file_operations,
+# struct file, inode, vm_area_struct, seq_file, scatterlist, kstat, ...)
+init_timer_key			osm_init_timer_key
+queue_delayed_work_on		osm_queue_delayed_work_on
+cancel_delayed_work		osm_cancel_delayed_work
+register_shrinker		osm_register_shrinker
+sg_next				osm_sg_next
+filp_open			osm_filp_open
+filp_close			osm_filp_close
+vfs_llseek			osm_vfs_llseek
+vfs_read			osm_vfs_read
+vfs_write			osm_vfs_write
+do_mmap				osm_do_mmap
+do_munmap			osm_do_munmap
+__mm_populate			osm___mm_populate
+follow_pfn			osm_follow_pfn
+free_reserved_area		osm_free_reserved_area
+down_write			osm_down_write
+up_write			osm_up_write
+misc_register			osm_misc_register
+of_find_device_by_node		osm_of_find_device_by_node
+misc_deregister			osm_misc_deregister
+cdev_init			osm_cdev_init
+cdev_add			osm_cdev_add
+__register_chrdev		osm___register_chrdev
+proc_create_data		osm_proc_create_data
+PDE_DATA			osm_pde_data
+single_open			osm_single_open
+seq_printf			osm_seq_printf
+seq_vprintf			osm_seq_vprintf
+find_vma			osm_find_vma
+remap_pfn_range			osm_remap_pfn_range
+vfs_getattr			osm_vfs_getattr

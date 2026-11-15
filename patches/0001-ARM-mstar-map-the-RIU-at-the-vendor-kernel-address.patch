@@ -1,0 +1,42 @@
+From: opensigmastar
+Subject: [PATCH] ARM: mstar: map the RIU at the vendor kernel address
+
+Local patch for the SigmaStar vendor modules, not for mainline: mhal.ko
+accesses registers at the fixed virtual address 0xfd000000 + (pa -
+0x1f000000) that the vendor 4.9 kernel set up in mstar_map_io(). The
+addresses are compiled into the module (140 literal words), so the kernel
+has to provide the same static mapping.
+
+See docs/vendor-kernel-patches.md.
+---
+--- a/arch/arm/mach-mstar/mstarv7.c	2026-11-15 02:11:21.630989825 +0100
++++ b/arch/arm/mach-mstar/mstarv7.c	2026-11-15 02:12:24.417539875 +0100
+@@ -123,8 +123,28 @@
+ 		pr_warn("Failed to install memory barrier, DMA will be broken!\n");
+ }
+ 
++/*
++ * opensigmastar: the SigmaStar vendor modules (mhal.ko) access registers
++ * through the fixed virtual address of the vendor 4.9 kernel, which mapped
++ * the whole RIU (0x1f000000, 4 MiB) at 0xfd000000 in mstar_map_io(). They
++ * have these addresses compiled in, so the same static mapping is needed.
++ * Not for mainline.
++ */
++static void __init mstarv7_map_io(void)
++{
++	struct map_desc riu = {
++		.virtual	= 0xfd000000,
++		.pfn		= __phys_to_pfn(0x1f000000),
++		.length		= SZ_4M,
++		.type		= MT_DEVICE,
++	};
++
++	iotable_init(&riu, 1);
++}
++
+ DT_MACHINE_START(MSTARV7_DT, "MStar/Sigmastar Armv7 (Device Tree)")
+ 	.dt_compat	= mstarv7_board_dt_compat,
++	.map_io		= mstarv7_map_io,
+ 	.init_machine	= mstarv7_init,
+ 	.smp		= smp_ops(mstarv7_smp_ops),
+ MACHINE_END

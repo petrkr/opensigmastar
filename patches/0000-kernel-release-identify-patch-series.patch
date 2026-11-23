@@ -1,0 +1,10 @@
+From: opensigmastar
+Subject: [PATCH] localversion: identify the opensigmastar kernel patches
+
+Make the firmware-specific patch series visible in kernel release strings,
+including uname, /proc and module vermagic.
+---
+--- /dev/null
++++ b/localversion-osm-patches
+@@ -0,0 +1 @@
++-osm-patches

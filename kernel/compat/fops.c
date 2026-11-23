@@ -88,6 +88,9 @@ static DEFINE_MUTEX(osm_fops_lock);
 static DEFINE_HASHTABLE(osm_files, 8);
 static DEFINE_SPINLOCK(osm_files_lock);
 
+#define OSM_VENDOR_MODULES	32
+static struct module *osm_vendor_modules[OSM_VENDOR_MODULES];
+
 static inline void put32(u8 *base, unsigned int off, u32 v)
 {
 	*(u32 *)(base + off) = v;
@@ -98,9 +101,17 @@ static inline u32 get32(const u8 *base, unsigned int off)
 	return *(const u32 *)(base + off);
 }
 
-static bool vendor_fn(struct osm_fops *of, const void *fn)
+static bool vendor_fn(const void *fn)
 {
-	return of->owner && within_module((unsigned long)fn, of->owner);
+	int i;
+
+	for (i = 0; i < OSM_VENDOR_MODULES; i++) {
+		struct module *mod = READ_ONCE(osm_vendor_modules[i]);
+
+		if (mod && within_module((unsigned long)fn, mod))
+			return true;
+	}
+	return false;
 }
 
 static struct osm_file49 *osm_file_lookup(struct file *file)
@@ -144,7 +155,7 @@ static void osm_file_sync_out(struct osm_file49 *f)
 #define OSM_CALL(f, n, type, vargs, rargs) ({				\
 	typeof(type) fn = SLOT(f, n);					\
 	typeof(fn vargs) r;						\
-	if (vendor_fn((f)->of, fn)) {					\
+	if (vendor_fn(fn)) {					\
 		struct osm_entry e;					\
 		osm_file_sync_in(f);					\
 		osm_enter(&e);						\
@@ -268,18 +279,40 @@ struct osm_poll {
 };
 
 void osm_wq_dump_inited(void);
+bool osm_wq_was_inited(void *wq49);
 
 static void osm_qproc(struct file *file49, wait_queue_head_t *wq49, poll_table *pt)
 {
 	struct osm_poll *p = container_of(pt, struct osm_poll, pt);
-	wait_queue_head_t *wq = osm_wq(wq49);
+	wait_queue_head_t *wq = osm_wq_native(wq49);
+	wait_queue_head_t *raw = osm_wq(wq49);
+	int slot = osm_wq_native_slot(wq49);
+	unsigned int bad = 0;
 
 	/* an uninitialised, freed or corrupted 4.9 head: skip it, do not oops */
-	if ((unsigned long)wq49 < PAGE_SIZE || !wq->head.next ||
-	    (unsigned long)wq->head.next < PAGE_OFFSET ||
-	    wq->head.next->prev != &wq->head) {
-		if (WARN_ONCE(1, "osm: poll on uninitialised wait queue %px\n", wq49))
-			osm_wq_dump_inited();
+	if ((unsigned long)wq49 < PAGE_SIZE)
+		bad |= BIT(0);
+	if (!wq)
+		bad |= BIT(1);
+	if (!osm_wq_was_inited(wq49))
+		bad |= BIT(2);
+	if (wq && !wq->head.next)
+		bad |= BIT(3);
+	/* Native heads may live in the ARM module-vmalloc window below
+	 * PAGE_OFFSET (e.g. bf80...).  Accept every kernel/module mapping. */
+	if (wq && wq->head.next &&
+	    ((unsigned long)wq->head.next < MODULES_VADDR ||
+	     (unsigned long)wq->head.next >= VMALLOC_END))
+		bad |= BIT(4);
+	if (wq && wq->head.next && wq->head.next->prev != &wq->head)
+		bad |= BIT(5);
+	if (bad) {
+		pr_warn("osm: qproc reject bad=%#x slot=%d raw=%px rnext=%px rprev=%px "
+			"native=%px nnext=%px nprev=%px expect=%px caller=%pS\n",
+			bad, slot, wq49, raw ? raw->head.next : NULL,
+			raw ? raw->head.prev : NULL, wq,
+			wq ? wq->head.next : NULL, wq ? wq->head.prev : NULL,
+			wq ? &wq->head : NULL, __builtin_return_address(0));
 		return;
 	}
 	p->orig->_qproc(p->real, wq, p->orig);
@@ -290,6 +323,8 @@ static __poll_t osm_poll(struct file *file, poll_table *pt)
 	struct osm_file49 *f = osm_file_lookup(file);
 	struct osm_poll p = { .orig = pt, .real = file };
 	poll_table *vpt = NULL;
+	__poll_t (*fn)(void *, poll_table *);
+	__poll_t ret;
 
 	if (!f || !SLOT(f, F49_POLL))
 		return DEFAULT_POLLMASK;
@@ -298,8 +333,19 @@ static __poll_t osm_poll(struct file *file, poll_table *pt)
 		p.pt._key = pt->_key;
 		vpt = &p.pt;
 	}
-	return OSM_CALL(f, F49_POLL, __poll_t (*)(void *, poll_table *),
-			(f->file, vpt), (file, pt));
+	fn = SLOT(f, F49_POLL);
+	if (vendor_fn(fn)) {
+		struct osm_entry e;
+
+		osm_file_sync_in(f);
+		osm_enter(&e);
+		ret = fn(f->file, vpt);
+		osm_leave(&e);
+		osm_file_sync_out(f);
+	} else {
+		ret = fn(file, pt);
+	}
+	return ret;
 }
 
 static int osm_mmap(struct file *file, struct vm_area_struct *vma)
@@ -368,9 +414,22 @@ static int osm_module_notify(struct notifier_block *nb, unsigned long action, vo
 {
 	struct module *mod = data;
 	struct osm_fops *of, *t;
+	int i;
+
+	if (action == MODULE_STATE_COMING) {
+		for (i = 0; i < OSM_VENDOR_MODULES; i++)
+			if (!READ_ONCE(osm_vendor_modules[i])) {
+				WRITE_ONCE(osm_vendor_modules[i], mod);
+				break;
+			}
+		return NOTIFY_DONE;
+	}
 
 	if (action != MODULE_STATE_GOING)
 		return NOTIFY_DONE;
+	for (i = 0; i < OSM_VENDOR_MODULES; i++)
+		if (READ_ONCE(osm_vendor_modules[i]) == mod)
+			WRITE_ONCE(osm_vendor_modules[i], NULL);
 	mutex_lock(&osm_fops_lock);
 	list_for_each_entry_safe(of, t, &osm_fops_list, list) {
 		if (of->owner == mod) {

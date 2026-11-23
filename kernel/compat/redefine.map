@@ -9,6 +9,7 @@ vmalloc				vmalloc_noprof
 # Removed, inlined or changed signature
 __aeabi_ldivmod			osm___aeabi_ldivmod
 __aeabi_uldivmod		osm___aeabi_uldivmod
+__aeabi_uidiv			osm___aeabi_uidiv
 _raw_spin_unlock		osm__raw_spin_unlock
 getnstimeofday64		osm_getnstimeofday64
 jiffies_to_msecs		osm_jiffies_to_msecs

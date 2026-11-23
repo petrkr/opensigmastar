@@ -18,6 +18,9 @@
 #include <linux/uaccess.h>
 #include <linux/spinlock.h>
 #include <linux/list.h>
+#include <linux/sched.h>
+#include <linux/fs_struct.h>
+#include <linux/pid.h>
 #include "osm_compat.h"
 
 #define OSM_FILE_MAGIC		0x4f534d46	/* "OSMF" */
@@ -88,12 +91,47 @@ static struct file *osm_file_real(void *file49, struct osm_file **shp)
 	return sh ? sh->real : file49;
 }
 
+/*
+ * On 4.9 a kernel thread resolves absolute paths in the root filesystem. On
+ * current kernels init_fs is the empty rootfs under the real root (it is
+ * only visible to init and its children), so filp_open() of an absolute
+ * path in a kernel thread (mhal firmware, iqfile) finds nothing. Resolve
+ * absolute paths of kernel threads in the root of init, as 4.9 did.
+ */
+static struct file *osm_filp_open_root(const char *name, int flags,
+				       umode_t mode)
+{
+	struct task_struct *init;
+	struct path root;
+	struct file *file;
+
+	if (!(current->flags & PF_KTHREAD) || name[0] != '/')
+		return filp_open(name, flags, mode);
+
+	init = get_pid_task(find_vpid(1), PIDTYPE_PID);
+	if (!init)
+		return filp_open(name, flags, mode);
+	task_lock(init);
+	if (init->fs)
+		get_fs_root(init->fs, &root);
+	else
+		root.mnt = NULL;
+	task_unlock(init);
+	put_task_struct(init);
+	if (!root.mnt)
+		return filp_open(name, flags, mode);
+
+	file = file_open_root(&root, name + 1, flags, mode);
+	path_put(&root);
+	return file;
+}
+
 struct file *osm_filp_open(const char *name, int flags, umode_t mode)
 {
 	struct file *real;
 	struct osm_file *sh;
 
-	real = filp_open(name, flags, mode);
+	real = osm_filp_open_root(name, flags, mode);
 	if (IS_ERR(real))
 		return real;
 
@@ -160,8 +198,9 @@ ssize_t osm_vfs_read(struct file *file49, char *buf, size_t count, loff_t *pos)
 	struct file *real = osm_file_real(file49, &sh);
 	ssize_t ret;
 	void *kbuf;
+	bool kernel_ds = osm_kernel_ds();
 
-	if (osm_kernel_ds()) {
+	if (kernel_ds) {
 		ret = kernel_read(real, buf, count, pos);
 	} else {
 		kbuf = kvmalloc(count, GFP_KERNEL);
@@ -170,6 +209,8 @@ ssize_t osm_vfs_read(struct file *file49, char *buf, size_t count, loff_t *pos)
 		ret = kernel_read(real, kbuf, count, pos);
 		if (ret > 0 && copy_to_user((void __user *)buf, kbuf, ret))
 			ret = -EFAULT;
+	}
+	if (!kernel_ds) {
 		kvfree(kbuf);
 	}
 	if (sh && pos == &sh->f_pos)

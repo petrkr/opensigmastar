@@ -27,9 +27,46 @@ EXPORT_SYMBOL(osm_wq);
 
 void osm___init_waitqueue_head(void *wq49, const char *name, struct lock_class_key *key);
 /* debugging: the last wait queue heads initialised by vendor code */
-#define OSM_WQ_RING 16
+#define OSM_WQ_RING 1024
 static void *osm_wq_inited[OSM_WQ_RING];
 static atomic_t osm_wq_inited_n = ATOMIC_INIT(0);
+
+struct osm_wq_map {
+	void *wq49;
+	wait_queue_head_t native;
+};
+static struct osm_wq_map osm_wq_maps[OSM_WQ_RING];
+
+struct wait_queue_head *osm_wq_native(void *wq49)
+{
+	int i = osm_wq_native_slot(wq49);
+
+	return i >= 0 ? &osm_wq_maps[i].native : NULL;
+}
+EXPORT_SYMBOL(osm_wq_native);
+
+int osm_wq_native_slot(void *wq49)
+{
+	int i;
+
+	for (i = 0; i < OSM_WQ_RING; i++)
+		if (READ_ONCE(osm_wq_maps[i].wq49) == wq49)
+			return i;
+	return -1;
+}
+EXPORT_SYMBOL(osm_wq_native_slot);
+
+bool osm_wq_was_inited(void *wq49)
+{
+	int i;
+
+	for (i = 0; i < OSM_WQ_RING; i++) {
+		if (READ_ONCE(osm_wq_inited[i]) == wq49)
+			return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL(osm_wq_was_inited);
 
 void osm_wq_dump_inited(void)
 {
@@ -42,7 +79,11 @@ EXPORT_SYMBOL(osm_wq_dump_inited);
 
 void osm___init_waitqueue_head(void *wq49, const char *name, struct lock_class_key *key)
 {
-	osm_wq_inited[atomic_inc_return(&osm_wq_inited_n) % OSM_WQ_RING] = wq49;
+	int slot = atomic_inc_return(&osm_wq_inited_n) % OSM_WQ_RING;
+
+	osm_wq_inited[slot] = wq49;
+	osm_wq_maps[slot].wq49 = wq49;
+	init_waitqueue_head(&osm_wq_maps[slot].native);
 	/* the vendor code also takes the 4.9 lock itself: unlocked raw lock */
 	memset(wq49, 0, OSM_LOCK49_PAD);
 	init_waitqueue_head(osm_wq(wq49));
@@ -51,19 +92,22 @@ EXPORT_SYMBOL(osm___init_waitqueue_head);
 
 void osm___wake_up(void *wq49, unsigned int mode, int nr, void *key)
 {
-	__wake_up(osm_wq(wq49), mode, nr, key);
+	wait_queue_head_t *wq = osm_wq_native(wq49);
+	__wake_up(wq ? wq : osm_wq(wq49), mode, nr, key);
 }
 EXPORT_SYMBOL(osm___wake_up);
 
 long osm_prepare_to_wait_event(void *wq49, struct wait_queue_entry *wq_entry, int state)
 {
-	return prepare_to_wait_event(osm_wq(wq49), wq_entry, state);
+	wait_queue_head_t *wq = osm_wq_native(wq49);
+	return prepare_to_wait_event(wq ? wq : osm_wq(wq49), wq_entry, state);
 }
 EXPORT_SYMBOL(osm_prepare_to_wait_event);
 
 void osm_finish_wait(void *wq49, struct wait_queue_entry *wq_entry)
 {
-	finish_wait(osm_wq(wq49), wq_entry);
+	wait_queue_head_t *wq = osm_wq_native(wq49);
+	finish_wait(wq ? wq : osm_wq(wq49), wq_entry);
 }
 EXPORT_SYMBOL(osm_finish_wait);
 

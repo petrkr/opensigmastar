@@ -31,7 +31,10 @@
 #define OSM_TASK49_MM		552
 #define OSM_TASK49_PID		680
 #define OSM_TASK49_TGID		684
-#define OSM_TASK49_SIZE		704
+#define OSM_TASK49_COMM		0x3a4
+#define OSM_TASK49_ALLOC_LOCK	0x41c
+#define OSM_TASK49_ALLOC_LOCK_SIZE	16
+#define OSM_TASK49_SIZE		0x42c
 
 #define OSM_MM49_MMAP_SEM	72
 #define OSM_MM49_SIZE		128
@@ -45,12 +48,20 @@ struct osm_mm49 {
 	struct mm_struct *mm;
 };
 
+struct osm_task49;
+
 struct osm_entry {
 	u32 saved[(OSM_TI49_END - OSM_TI49_PREEMPT) / 4];
 	u8 *ti;
-	u8 task[OSM_TASK49_SIZE] __aligned(8);
+	struct osm_task49 *task;
 	struct osm_mm49 mm;
 	struct list_head vmas;	/* 4.9 vm_area_structs handed out, see vma.c */
+};
+
+/* Keep the large 4.9 task shadow off the small kernel stack. */
+struct osm_task49 {
+	struct osm_entry *entry;
+	u8 raw[OSM_TASK49_SIZE] __aligned(8);
 };
 
 void osm_enter(struct osm_entry *e);
@@ -62,6 +73,8 @@ void osm_vma_release(struct osm_entry *e);
 
 /* current wait queue head inside a 4.9 one, see locks.c */
 struct wait_queue_head *osm_wq(void *wq49);
+struct wait_queue_head *osm_wq_native(void *wq49);
+int osm_wq_native_slot(void *wq49);
 
 struct file_operations;
 struct kobject;

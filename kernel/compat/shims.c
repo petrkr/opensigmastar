@@ -9,6 +9,7 @@
 #include <linux/jiffies.h>
 #include <linux/math64.h>
 #include <linux/module.h>
+#include <linux/uaccess.h>
 #include <linux/mutex.h>
 #include <linux/sched/debug.h>
 #include <linux/slab.h>
@@ -19,6 +20,7 @@
 
 void osm___aeabi_uldivmod(void);
 void osm___aeabi_ldivmod(void);
+void osm___aeabi_uidiv(void);
 
 #ifndef CONFIG_STACKPROTECTOR
 /* The vendor modules are built with -fstack-protector */
@@ -286,6 +288,7 @@ s64 osm_div64_s64_rem(s64 n, s64 d, s64 *rem)
 
 EXPORT_SYMBOL(osm___aeabi_uldivmod);
 EXPORT_SYMBOL(osm___aeabi_ldivmod);
+EXPORT_SYMBOL(osm___aeabi_uidiv);
 
 int osm_fops_init(void);
 void osm_fops_exit(void);
@@ -302,9 +305,11 @@ static int __init osm_compat_init(void)
 	if (ret)
 		return ret;
 	ret = osm_mm_init();
-	if (ret)
+	if (ret) {
 		osm_fops_exit();
-	return ret;
+		return ret;
+	}
+	return 0;
 }
 module_init(osm_compat_init);
 

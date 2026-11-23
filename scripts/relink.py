@@ -144,6 +144,109 @@ MODULE_LICENSE("{license}");
 MODULE_DESCRIPTION("{desc}");
 '''
 
+MHAL_RIU_STUB = '''
+/* The post-link patcher redirects one legacy RIU helper here. */
+extern void __iomem *osm_riu;
+static __used __naked void osm_mhal_riu_r0(void)
+{
+	asm volatile(
+		"mov r3, lr\\n"
+		"mov lr, ip\\n"
+		"lsl.w r0, r0, #1\\n"
+		"ldr ip, =osm_riu\\n"
+		"ldr ip, [ip]\\n"
+		"add.w r0, r0, ip\\n"
+		"bx r3\\n");
+}
+
+static __used __naked void osm_mhal_riu_mov_r3(void)
+{
+	asm volatile(
+		"ldr r3, =osm_riu\\n"
+		"ldr r3, [r3]\\n"
+		"b.w .\\n");
+}
+
+static __used __naked void osm_mhal_riu_add_r0(void)
+{
+	asm volatile(
+		"ldr ip, =osm_riu\\n"
+		"ldr ip, [ip]\\n"
+		"add.w r0, r0, ip\\n"
+		"bx lr\\n");
+}
+
+static __used __naked void osm_mhal_riu_add_r4(void)
+{
+	asm volatile(
+		"ldr ip, =osm_riu\\n"
+		"ldr ip, [ip]\\n"
+		"add.w r4, r4, ip\\n"
+		"bx lr\\n");
+}
+
+static __used __naked void osm_mhal_riu_add_r3(void)
+{
+	asm volatile(
+		"ldr ip, =osm_riu\\n"
+		"ldr ip, [ip]\\n"
+		"add.w r3, r3, ip\\n"
+		"bx lr\\n");
+}
+
+/* HAL_CMDQ stores legacy 0xfdxxxxxx bank bases in a BSS table after load. */
+static __used __naked void osm_mhal_riu_cmdq_r2(void)
+{
+	asm volatile(
+		"movw ip, #0\\n"
+		"movt ip, #0xfd00\\n"
+		"sub.w r2, r2, ip\\n"
+		"ldr ip, =osm_riu\\n"
+		"ldr ip, [ip]\\n"
+		"add.w r2, r2, ip\\n"
+		"add.w r1, r2, #0x200000\\n"
+		"bx lr\\n");
+}
+
+static __used __naked void osm_mhal_riu_cmdq_field_r2(void)
+{
+	asm volatile(
+		"add.w r2, r1, r2, lsl #1\\n"
+		"movw ip, #0\\n"
+		"movt ip, #0xfd00\\n"
+		"sub.w r2, r2, ip\\n"
+		"ldr ip, =osm_riu\\n"
+		"ldr ip, [ip]\\n"
+		"add.w r2, r2, ip\\n"
+		"bx lr\\n");
+}
+
+/* Direct read helpers need r3 = osm_riu + (r0 << 1). */
+static __used __naked void osm_mhal_riu_r3_r0tmp(void)
+{
+	asm volatile(
+		"mov r2, lr\\n"
+		"lsl.w r3, r0, #1\\n"
+		"ldr r0, =osm_riu\\n"
+		"ldr r0, [r0]\\n"
+		"add.w r3, r3, r0\\n"
+		"mov lr, ip\\n"
+		"bx r2\\n");
+}
+
+static __used __naked void osm_mhal_riu_r3_r1tmp(void)
+{
+	asm volatile(
+		"mov r1, lr\\n"
+		"lsl.w r3, r0, #1\\n"
+		"mov lr, ip\\n"
+		"ldr ip, =osm_riu\\n"
+		"ldr ip, [ip]\\n"
+		"add.w r3, r3, ip\\n"
+		"bx r1\\n");
+}
+'''
+
 EXIT = '''
 static void __exit osm_{name}_exit(void)
 {{
@@ -228,7 +331,8 @@ def main():
             exit_decl='void osm_%s_blob_exit(void);\n' % a.name if has_exit else '',
             exit_def=EXIT.format(name=a.name) if has_exit else '',
             exports=''.join('extern char %s[];\nEXPORT_SYMBOL(%s);\n' % (s, s)
-                            for s in exports)))
+                            for s in exports) +
+            (MHAL_RIU_STUB if a.name == 'mhal' else '')))
     print('%s: %d exports, %d pv stubs, exit %s' % (a.name, len(exports), npv,
                                                      'yes' if has_exit else 'no'))
 

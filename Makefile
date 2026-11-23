@@ -23,6 +23,7 @@ relink:
 
 modules: relink
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel OSM_BLOBS="$(BLOB_NAMES)" modules
+	$(PYTHON) scripts/patch_mhal_riu.py kernel/blobs/mhal.ko
 
 dtb: $(DTB)
 

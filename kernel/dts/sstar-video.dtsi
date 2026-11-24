@@ -3,20 +3,12 @@
  * Device tree nodes looked up by the SigmaStar vendor modules (mhal), from
  * the BSP infinity6e.dtsi, mapped to the mainline DT: registers as &riu
  * offsets, interrupts on intc_irq (vendor INT_IRQ - 32), clocks from the
- * mainline clkgen where it has them, fixed-clock placeholders otherwise.
+ * mainline clkgen (vendor GOP0 is FCLK1).
  * Board values (CSI lanes, VIF pads, sensorif I2C, audio) are those of the
  * vendor ssc012b-s01a board and still have to be checked for SSC38M.
  */
 #include <dt-bindings/clock/sstar,ssc338q-clkgen.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
-
-&clocks {
-	/* TODO: real clkgen gates/muxes missing in mainline; placeholders so of_clk_get() succeeds */
-	clk_isp:    clk-isp    { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <384000000>; }; /* TODO rate */
-	clk_fclk1:  clk-fclk1  { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <432000000>; }; /* TODO */
-	clk_odclk:  clk-odclk  { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <216000000>; }; /* TODO */
-	clk_gop0:   clk-gop0   { compatible = "fixed-clock"; #clock-cells = <0>; clock-frequency = <432000000>; }; /* TODO */
-};
 
 &riu {
 	/* all nodes need status okay + must become platform devices (of_find_device_by_node) */
@@ -26,7 +18,7 @@
 		io_phy_addr = <0x1f000000>;
 		banks = <0x1302>;
 		interrupts-extended = <&intc_irq GIC_SPI 25 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&clk_isp>;
+		clocks = <&clkgen SSC338Q_CLKGEN_ISP>;
 		clock-frequency-index = <0>;
 		status = "okay";
 	};
@@ -74,7 +66,7 @@
 		reg = <0x242000 0x100>;
 		interrupts-extended = <&intc_irq GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>,
 				      <&intc_irq GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&clk_fclk1>, <&clk_odclk>;
+		clocks = <&clkgen SSC338Q_CLKGEN_FCLK1>, <&clkgen SSC338Q_CLKGEN_ODCLK>;
 		clock-names = "CLK_fclk1", "CLK_fclk2", "CLK_odclk"; /* vendor has 3 names for 2 clocks; TODO */
 		clk-select = <2>;
 		status = "okay";
@@ -100,7 +92,7 @@
 
 	gop {
 		compatible = "sigmastar,gop";
-		clocks = <&clk_gop0>, <&clk_fclk1>, <&clkgen SSC338Q_CLKGEN_DIP>, <&clkgen SSC338Q_CLKGEN_LDC>;
+		clocks = <&clkgen SSC338Q_CLKGEN_FCLK1>, <&clkgen SSC338Q_CLKGEN_FCLK1>, <&clkgen SSC338Q_CLKGEN_DIP>, <&clkgen SSC338Q_CLKGEN_LDC>;
 		status = "okay";
 	};
 
@@ -133,13 +125,13 @@
 	pnl {
 		compatible = "sstar,pnl";
 		ttl-24bit-mode = <0>; ttl-16bit-mode = <1>; jtag-mode = <1>;
-		clocks = <&clk_odclk>; clock-names = "CLK_odclk";
+		clocks = <&clkgen SSC338Q_CLKGEN_ODCLK>; clock-names = "CLK_odclk";
 		interrupts-extended = <&intc_irq GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>;
 		status = "okay";
 	};
 	disp {
 		compatible = "sstar,disp";
-		clocks = <&clk_odclk>; clock-names = "CLK_odclk";
+		clocks = <&clkgen SSC338Q_CLKGEN_ODCLK>; clock-names = "CLK_odclk";
 		interrupts-extended = <&intc_irq GIC_SPI 59 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>,
 				      <&intc_irq GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>, <&intc_irq GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>;
 		status = "okay";

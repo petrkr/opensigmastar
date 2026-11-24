@@ -10,6 +10,23 @@ Ethernet, SD, SPI NAND, USB, ...) are not here. They are in the Linux tree
 take: ports of the vendor support code and wrappers around the closed
 vendor modules.
 
+## Compatibility
+
+| SoC     | Family     | Board      | Vendor SDK (mhal) | Status |
+|---------|------------|------------|-------------------|--------|
+| SSC338Q | Infinity6E | SSC_38M_2.0 | 22050121         | H.264 1080p20 RTSP, JPEG snapshot and auto exposure work |
+
+Other SoCs are not supported yet.
+
+## Known vendor bugs
+
+- Division by zero at stream start: `_MI_VENC_OnInputPortFrcChanged`
+  (mi_venc) divides by its cached previous frame rate, which is 0 on the
+  first call, and `IQ_ISOIndexGet` (mhal) divides by zero before the first
+  AE statistics. The vendor kernel patches `__aeabi_uidiv` to the hardware
+  `udiv` instruction, which returns 0, so this was never visible there.
+  `osm___aeabi_uidiv` uses `udiv` as well, with the same result.
+
 ## Layout
 
 - `kernel/compat/`: compatibility layer that provides the Linux 4.9 kernel

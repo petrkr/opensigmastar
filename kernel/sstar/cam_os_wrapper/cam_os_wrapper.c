@@ -30,6 +30,7 @@
 #define CAM_OS_LINUX_KERNEL
 
 #include <linux/sched.h>
+#include <uapi/linux/sched/types.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
@@ -409,11 +410,22 @@ static int CamOsThreadEntry(void *pData)
     return nRet;
 }
 
-// sched_setscheduler() is not exported any more: RT threads get the
-// default SCHED_FIFO priority
-static void CamOsThreadSetRt(struct task_struct *tpThreadHandle)
+// sched_setscheduler() is not exported any more: use sched_setattr_nocheck()
+// with the vendor SCHED_RR mapping (nPriority 71..94 -> 1..94, 95..100 -> 95..99)
+static void CamOsThreadSetRt(struct task_struct *tpThreadHandle, u32 nPriority)
 {
-    sched_set_fifo(tpThreadHandle);
+    struct sched_attr tAttr = {
+        .size = sizeof(tAttr),
+        .sched_policy = SCHED_RR,
+    };
+
+    if (nPriority < 95)
+        tAttr.sched_priority = (nPriority - 71) * 93 / 23 + 1;
+    else
+        tAttr.sched_priority = (nPriority < 100) ? nPriority : 99;
+
+    if (sched_setattr_nocheck(tpThreadHandle, &tAttr))
+        CAM_OS_WARN("set priority fail");
 }
 
 CamOsRet_e CamOsThreadCreate(CamOsThread *ptThread,
@@ -462,7 +474,7 @@ CamOsRet_e CamOsThreadCreate(CamOsThread *ptThread,
             }
             else if((ptAttrb->nPriority > 70) && (ptAttrb->nPriority <= 100))
             {
-                CamOsThreadSetRt(tpThreadHandle);
+                CamOsThreadSetRt(tpThreadHandle, ptAttrb->nPriority);
             }
         }
 
@@ -496,7 +508,7 @@ CamOsRet_e CamOsThreadChangePriority(CamOsThread tThread, u32 nPriority)
     }
     else if(tpThreadHandle && (nPriority > 70) && (nPriority <= 100))
     {
-        CamOsThreadSetRt(tpThreadHandle);
+        CamOsThreadSetRt(tpThreadHandle, nPriority);
     }
     else
     {

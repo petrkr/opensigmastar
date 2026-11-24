@@ -328,8 +328,10 @@ static __poll_t osm_poll(struct file *file, poll_table *pt)
 
 	if (!f || !SLOT(f, F49_POLL))
 		return DEFAULT_POLLMASK;
-	if (pt && pt->_qproc) {
-		init_poll_funcptr(&p.pt, osm_qproc);
+	/* do_poll() clears _qproc after the first pass but keeps pt: the
+	 * vendor poll treats pt == NULL as "no event" and skips its check */
+	if (pt) {
+		init_poll_funcptr(&p.pt, pt->_qproc ? osm_qproc : NULL);
 		p.pt._key = pt->_key;
 		vpt = &p.pt;
 	}

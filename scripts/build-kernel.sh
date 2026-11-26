@@ -56,7 +56,7 @@ mkdir -p "$out"
 cp "$cfgdir/.config" "$out/.config"
 cat "$(dirname "$0")/osm.config" >> "$out/.config"
 make -C "$ksrc" O="$(realpath "$out")" LOCALVERSION="-p$patchset_id" olddefconfig
-make -C "$ksrc" O="$(realpath "$out")" "$@" LOCALVERSION="-p$patchset_id" zImage dtbs modules_prepare
+make -C "$ksrc" O="$(realpath "$out")" "$@" LOCALVERSION="-p$patchset_id" zImage dtbs modules_prepare modules
 kernel_release=$(cat "$out/include/config/kernel.release")
 case "$kernel_release" in
 	*-osm-patches-p"$patchset_id") ;;
@@ -65,4 +65,5 @@ case "$kernel_release" in
 		exit 1
 		;;
 esac
-cp "$out/vmlinux.symvers" "$out/Module.symvers"
+# make modules already wrote Module.symvers (vmlinux + in-tree modules)
+[ -s "$out/Module.symvers" ] || cp "$out/vmlinux.symvers" "$out/Module.symvers"

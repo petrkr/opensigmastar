@@ -14,6 +14,9 @@ CMDQ ?= vendor
 # mhal VIF/CSI: vendor (blob implementation), shim (forwards to the blob and logs),
 # own (kernel/blobs/mhal_vif_own.c), see scripts/relink.py --vif
 VIF ?= vendor
+# mhal SCL (scaler behind MHalVpe*Scl*): vendor, shim (forwards and logs) or own
+# (kernel/blobs/mhal_scl_own.c), see scripts/relink.py --scl
+SCL ?= vendor
 
 # Kernel source and build tree for the board DTS (dtc from the build tree)
 KSRC ?= $(KDIR)/source
@@ -24,12 +27,12 @@ all: modules
 
 relink:
 	for b in $(BLOBS); do \
-		$(PYTHON) scripts/relink.py --map kernel/compat/redefine.map --symvers $(KDIR)/Module.symvers --extra-exports scripts/relink.exports --cmdq $(CMDQ) --vif $(VIF) \
+		$(PYTHON) scripts/relink.py --map kernel/compat/redefine.map --symvers $(KDIR)/Module.symvers --extra-exports scripts/relink.exports --cmdq $(CMDQ) --vif $(VIF) --scl $(SCL) \
 			$(VENDOR)/$$b.ko $$(basename $$b) kernel/blobs || exit 1; \
 	done
 
 modules: relink
-	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel OSM_BLOBS="$(BLOB_NAMES)" OSM_CMDQ="$(CMDQ)" OSM_VIF="$(VIF)" modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel OSM_BLOBS="$(BLOB_NAMES)" OSM_CMDQ="$(CMDQ)" OSM_VIF="$(VIF)" OSM_SCL="$(SCL)" modules
 	$(PYTHON) scripts/patch_mhal_riu.py kernel/blobs/mhal.ko
 
 dtb: $(DTB)

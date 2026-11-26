@@ -54,6 +54,19 @@ VIF_CUT = (
     'Drv_CSISetLane', 'Drv_CSISetClkDataSkip', 'Drv_CSISetLongPacket',
 )
 
+# mhal SCL cut (--scl): the 17 MHalVpe*Scl* entry points that mi_vpe imports
+# (checked on the relocations of mi_vpe and mhal: nothing else outside the SCL
+# code calls them; kernel/blobs/mhal_scl_*.c has the prototypes)
+SCL_CUT = (
+    'MHalVpeCreateSclInstance', 'MHalVpeDestroySclInstance', 'MHalVpeSclCheckIrq',
+    'MHalVpeSclClearIrq', 'MHalVpeSclDbgLevel', 'MHalVpeSclDmaPortConfig',
+    'MHalVpeSclEnableIrq', 'MHalVpeSclGetActiveBuf', 'MHalVpeSclGetIrqNum',
+    'MHalVpeSclGetQpHistogram', 'MHalVpeSclInputConfig',
+    'MHalVpeSclPortMirrorFlipConfig', 'MHalVpeSclPortSizeConfig',
+    'MHalVpeSclPreCropConfig', 'MHalVpeSclProcess', 'MHalVpeSclReset',
+    'MHalVpeSclSetWaitDone',
+)
+
 REMOVE = ('.gnu.linkonce.this_module', '.modinfo', '__versions',
           '__ksymtab', '__ksymtab_gpl', '__ksymtab_strings', '.pv_table')
 
@@ -309,6 +322,12 @@ def main():
                     'the blob code gets the aliases __vendor_MHAL_CMDQ_*, '
                     'kernel/blobs/mhal_cmdq_shim.c defines them; own: they '
                     'become undefined and osm_cmdq provides them')
+    ap.add_argument('--scl', choices=('vendor', 'shim', 'own'), default='vendor',
+                    help='mhal only: keep the blob SCL implementation (vendor); '
+                    'shim: the SCL_CUT entry points become undefined and the blob '
+                    'code gets the aliases __vendor_<name>, kernel/blobs/mhal_scl_shim.c '
+                    'defines them and forwards; own: undefined, '
+                    'kernel/blobs/mhal_scl_own.c implements them')
     ap.add_argument('--vif', choices=('vendor', 'shim', 'own'), default='vendor',
                     help='mhal only: keep the blob VIF/CSI implementation (vendor); '
                     'shim: the VIF_CUT entry points become undefined and the blob '
@@ -365,6 +384,16 @@ def main():
                                    (s, elf.names[defined[s][0]], defined[s][1]))
             elf.undefine(s)
         exports = [s for s in exports if s not in VIF_CUT]
+    if a.name == 'mhal' and a.scl != 'vendor':
+        defined = {n: (ndx, v) for _, n, v, _, _, ndx in elf.symbols() if ndx != SHN_UNDEF}
+        for s in SCL_CUT:
+            if s not in defined:
+                sys.exit('%s: no %s' % (a.ko, s))
+            if a.scl == 'shim':
+                cmdq_rename.append('__vendor_%s=%s:%#x,global,function' %
+                                   (s, elf.names[defined[s][0]], defined[s][1]))
+            elf.undefine(s)
+        exports = [s for s in exports if s not in SCL_CUT]
     if a.name == 'mhal' and a.vif == 'own':
         # the blob drivers of the vif and csi nodes must not bind: mhal_vif_own.c
         # drives the hardware. The compatible strings in the match tables (char

@@ -25,6 +25,9 @@
 static int ntrace = 6;			/* argument logs per member and id */
 module_param(ntrace, int, 0644);
 
+static int arrlog = -1;			/* engine id whose Multi arrays are dumped (-1 none) */
+module_param(arrlog, int, 0644);
+
 typedef long (*fn6)(long, long, long, long, long, long);
 
 static atomic_t api_cnt[16];
@@ -124,6 +127,15 @@ static long tramp(int w, long a, long b, long c, long d, long e, long f)
 	if (atomic_inc_return(&if_log[id][w]) <= ntrace) {
 		long r = ((fn6)ifc[id].orig[w])(a, b, c, d, e, f);
 
+		if (id == arrlog && (w == 7 || w == 9) && b && c > 0 && c <= 2000) {
+			u32 *p = (u32 *)b;
+			int i;
+
+			for (i = 0; i < c; i++)
+				pr_info("cmdq: id %d %s[%d] addr %#x val %#x%s%04x\n", id, if_name[w], i,
+					p[2 * i], p[2 * i + 1] & 0xffff, w == 7 ? " mask " : " pad ",
+					p[2 * i + 1] >> 16);
+		}
 		pr_info("cmdq: %llu id %d %s(%#lx, %#lx, %#lx, %#lx, %#lx) = %#lx\n",
 			(u64)jiffies_to_msecs(jiffies), id, if_name[w], b, c, d, e, f, r);
 		return r;

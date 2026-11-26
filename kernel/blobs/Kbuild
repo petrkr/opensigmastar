@@ -22,3 +22,11 @@ endif
 ifeq ($(OSM_VIF),own)
 mhal-y += mhal_vif_own.o
 endif
+
+# mhal SCL shim / own implementation (make SCL=shim|own, scripts/relink.py --scl)
+ifeq ($(OSM_SCL),shim)
+mhal-y += mhal_scl_shim.o
+endif
+ifeq ($(OSM_SCL),own)
+mhal-y += mhal_scl_own.o
+endif

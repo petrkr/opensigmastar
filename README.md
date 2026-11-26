@@ -27,6 +27,39 @@ Other SoCs are not supported yet.
   `udiv` instruction, which returns 0, so this was never visible there.
   `osm___aeabi_uidiv` uses `udiv` as well, with the same result.
 
+## Firmware
+
+The vendor modules open two firmware files by path:
+
+| File          | Used by          | Content                                        |
+|---------------|------------------|------------------------------------------------|
+| `chagall.bin` | mhal (VENC)      | encoder firmware, must match the mhal version  |
+| `iqfile0.bin` | mhal (ISP)       | ISP tuning of the sensor/board                 |
+
+`scripts/osm-load.sh` expects them in `/lib/firmware/sstar/` (env `FW`
+changes it) and passes that location to the vendor modules with their own
+parameters. Without them the vendor modules fall back to their built-in
+vendor paths (`/config/iqfile`, `/config/venc_fw/chagall.bin`,
+`/data/ut/chagall.bin`). When loading the modules by hand, set:
+
+- `mhal drv_venc_wrapper.fw_load_path=<dir>/chagall.bin` (the
+  `mi_venc fw_path=` parameter is not used for loading)
+- `echo isproot <dir> >/dev/ispmid` (after mi_venc, before the sensor
+  module) for `iqfile0.bin`; without it mhal silently falls back to a
+  built-in default IQ
+
+The files are opened in the root of the process that starts the stream: a
+streamer running in a chroot needs them at the same path inside the chroot.
+The vendor 3A library (`libcus3a.so`) also reads `<isproot>/iqfile0.bin`
+itself.
+
+## Audio
+
+The vendor audio modules `mi_ai` and `mi_ao` are built but not loaded by
+`scripts/osm-load.sh`: audio (BACH) is handled by the mainline ALSA driver
+(`sound/soc/sstar/`, Linux tree), which drives the same hardware block.
+Use ALSA instead of the vendor MI_AI/MI_AO API.
+
 ## Layout
 
 - `kernel/compat/`: compatibility layer that provides the Linux 4.9 kernel

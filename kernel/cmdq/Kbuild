@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0
-# osm_cmdq replaces the CMDQ engine code of the mhal blob, selected when the
-# blobs are relinked (make CMDQ=shim|own, see scripts/relink.py --cmdq).
+# osm_cmdq: replacement for the CMDQ engine code of the mhal blob, built for
+# make CMDQ=own (scripts/relink.py --cmdq own). The shim variant
+# (CMDQ=shim) is part of mhal, see ../blobs/mhal_cmdq_shim.c.
 # vendor (default): the blob implementation, no osm_cmdq.
 ccflags-y += -I$(src)/../compat -I$(src)/../sstar/include
 
-ifeq ($(OSM_CMDQ),shim)
-obj-m += osm_cmdq.o
-osm_cmdq-y := osm_cmdq_shim.o
-endif
 ifeq ($(OSM_CMDQ),own)
 obj-m += osm_cmdq.o
 osm_cmdq-y := osm_cmdq_drv.o

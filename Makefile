@@ -7,8 +7,9 @@ BLOBS := mhal mi_common mi_sys mi_rgn mi_ldc mi_ai mi_ao mi_mipitx mi_sensor \
 	mi_shadow mi_divp mi_vif mi_vpe mi_venc sensor/sensor_imx415_mipi
 BLOB_NAMES := $(notdir $(BLOBS))
 PYTHON ?= python3
-# mhal CMDQ: vendor (blob implementation), shim (osm_cmdq forwards and logs),
-# own (osm_cmdq is the engine driver), see kernel/cmdq/osm_cmdq*.c
+# mhal CMDQ: vendor (blob implementation), shim (forwards to the blob and logs),
+# own (osm_cmdq is the engine driver), see kernel/blobs/mhal_cmdq_shim.c and
+# kernel/cmdq/osm_cmdq_drv.c
 CMDQ ?= vendor
 
 # Kernel source and build tree for the board DTS (dtc from the build tree)

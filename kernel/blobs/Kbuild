@@ -9,3 +9,8 @@ endef
 
 OSM_BLOBS ?= mhal mi_common mi_sys
 $(foreach b,$(OSM_BLOBS),$(eval $(call osm_blob,$(b))))
+
+# mhal CMDQ shim (make CMDQ=shim, scripts/relink.py --cmdq shim)
+ifeq ($(OSM_CMDQ),shim)
+mhal-y += mhal_cmdq_shim.o
+endif

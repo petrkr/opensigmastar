@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * osm_cmdq shim: the MHAL_CMDQ_* entry points of the mhal blob (renamed to
- * __vendor_MHAL_CMDQ_* by scripts/relink.py --cmdq shim) are exported here
- * again, forwarding to the blob implementation and counting the calls.
- * The command queue interface returned by MHAL_CMDQ_GetSysCmdqService() is
- * wrapped the same way: every member counts and forwards. Only the users
- * outside of mhal (mi_sys and what it hands the iface to) are seen here, the
- * calls mhal makes to itself (ISP, SCL) stay inside the blob.
+ * CMDQ shim, linked into mhal.ko with scripts/relink.py --cmdq shim: the
+ * MHAL_CMDQ_* entry points are undefined in the blob (the blob code itself
+ * calls them too) and defined here. They forward to the blob implementation
+ * (__vendor_MHAL_CMDQ_*, aliases of the original functions) and count and log
+ * the calls. The command queue interface returned by
+ * MHAL_CMDQ_GetSysCmdqService() is wrapped the same way: every member counts,
+ * logs and forwards. All users are seen, the ISP and scaler code of mhal too.
  *
- * This module links against symbols of the proprietary mhal and therefore
- * must not use GPL-only kernel symbols.
+ * Part of the proprietary-tainted mhal module: no GPL-only kernel symbols.
  *
- * Statistics: echo 1 > /sys/module/osm_cmdq/parameters/dump (kernel log).
+ * Statistics: echo 1 > /sys/module/mhal/parameters/dump (kernel log),
+ * mhal.ntrace=N logs the first N calls of every member.
  */
 #include <linux/atomic.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/string.h>
@@ -21,7 +22,8 @@
 #define NID	4
 #define IF_WORDS 25			/* 100 bytes */
 #define IF_PRIV	18			/* word index of priv (+72) */
-#define LOGMAX	6			/* argument logs per member and id */
+static int ntrace = 6;			/* argument logs per member and id */
+module_param(ntrace, int, 0644);
 
 typedef long (*fn6)(long, long, long, long, long, long);
 
@@ -61,7 +63,7 @@ static atomic_t if_sum[NID][IF_WORDS];	/* sum of the count argument of the Multi
 		atomic_inc(&api_cnt[i]); \
 		r = __vendor_MHAL_CMDQ_##name(a, b, c, d, e, f); \
 		if (atomic_read(&api_cnt[i]) < 12) \
-			pr_info("osm_cmdq: %s(%#lx, %#lx, %#lx) = %#lx\n", #name, a, b, c, r); \
+			pr_info("cmdq: %s(%#lx, %#lx, %#lx) = %#lx\n", #name, a, b, c, r); \
 		return r; \
 	} \
 	EXPORT_SYMBOL(MHAL_CMDQ_##name)
@@ -97,7 +99,7 @@ long MHAL_CMDQ_GetSysCmdqService(long id, long desc, long force_riu)
 			if (tramps[i] && o[i])
 				ifc[id].wrap[i] = tramps[i];
 		ifc[id].valid = true;
-		pr_info("osm_cmdq: GetSysCmdqService(%ld, size %u align %u, riu %ld) = %p priv %#x\n",
+		pr_info("cmdq: GetSysCmdqService(%ld, size %u align %u, riu %ld) = %p priv %#x\n",
 			id, desc ? ((u32 *)desc)[0] : 0, desc ? ((u16 *)desc)[2] : 0,
 			force_riu, o, o[IF_PRIV]);
 		return (long)ifc[id].wrap;
@@ -119,9 +121,13 @@ static long tramp(int w, long a, long b, long c, long d, long e, long f)
 	atomic_inc(&if_cnt[id][w]);
 	if (w == 7 || w == 9)
 		atomic_add(b ? (int)c : 0, &if_sum[id][w]);
-	if (atomic_inc_return(&if_log[id][w]) <= LOGMAX)
-		pr_info("osm_cmdq: id %d %s(%#lx, %#lx, %#lx, %#lx)\n", id,
-			if_name[w], b, c, d, e);
+	if (atomic_inc_return(&if_log[id][w]) <= ntrace) {
+		long r = ((fn6)ifc[id].orig[w])(a, b, c, d, e, f);
+
+		pr_info("cmdq: %llu id %d %s(%#lx, %#lx, %#lx, %#lx, %#lx) = %#lx\n",
+			(u64)jiffies_to_msecs(jiffies), id, if_name[w], b, c, d, e, f, r);
+		return r;
+	}
 	return ((fn6)ifc[id].orig[w])(a, b, c, d, e, f);
 }
 
@@ -144,11 +150,11 @@ static void dump_stats(void)
 
 	for (i = 0; i < 12; i++)
 		if (api_name[i])
-			pr_info("osm_cmdq: api %-24s %d\n", api_name[i], atomic_read(&api_cnt[i]));
+			pr_info("cmdq: api %-24s %d\n", api_name[i], atomic_read(&api_cnt[i]));
 	for (id = 0; id < NID; id++)
 		for (i = 3; i < IF_WORDS; i++)
 			if (atomic_read(&if_cnt[id][i]))
-				pr_info("osm_cmdq: id %d %-24s %d (sum n %d)\n", id, if_name[i],
+				pr_info("cmdq: id %d %-24s %d (sum n %d)\n", id, if_name[i],
 					atomic_read(&if_cnt[id][i]), atomic_read(&if_sum[id][i]));
 }
 
@@ -161,11 +167,3 @@ static int dump_set(const char *val, const struct kernel_param *kp)
 static const struct kernel_param_ops dump_ops = { .set = dump_set };
 module_param_cb(dump, &dump_ops, NULL, 0200);
 
-static void __exit osm_cmdq_exit(void)
-{
-	dump_stats();
-}
-
-module_exit(osm_cmdq_exit);
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("mhal CMDQ shim: counting forwarder");

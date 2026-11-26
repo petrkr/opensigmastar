@@ -11,3 +11,14 @@
 	assigned-clocks = <&clkgen SSC338Q_CLKGEN_FCLK1>;
 	assigned-clock-parents = <&mpll_345m>;
 };
+
+/*
+ * CMDQ register banks (RIU offsets of banks 0x1120, 0x1123, 0x1124, 0x1125);
+ * the vendor driver has them hard-coded, osm_cmdq takes them from the node.
+ */
+&riu {
+	cmdq0 { reg = <0x224000 0x200>; };
+	cmdq1 { reg = <0x224600 0x200>; };
+	cmdq2 { reg = <0x224800 0x200>; };
+	cmdq3 { reg = <0x224a00 0x200>; };
+};

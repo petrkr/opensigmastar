@@ -27,6 +27,8 @@ module_param(ntrace, int, 0644);
 
 static int arrlog = -1;			/* engine id whose Multi arrays are dumped (-1 none) */
 module_param(arrlog, int, 0644);
+static int idonly = -1;			/* log only this engine id (-1 all) */
+module_param(idonly, int, 0644);
 static int arrmin;			/* dump only arrays with at least this many entries */
 module_param(arrmin, int, 0644);
 
@@ -126,7 +128,7 @@ static long tramp(int w, long a, long b, long c, long d, long e, long f)
 	atomic_inc(&if_cnt[id][w]);
 	if (w == 7 || w == 9)
 		atomic_add(b ? (int)c : 0, &if_sum[id][w]);
-	if (atomic_inc_return(&if_log[id][w]) <= ntrace) {
+	if (atomic_inc_return(&if_log[id][w]) <= ntrace && (idonly < 0 || id == idonly)) {
 		long r = ((fn6)ifc[id].orig[w])(a, b, c, d, e, f);
 
 		if (id == arrlog && (w == 7 || w == 9) && b && c >= arrmin && c > 0 && c <= 128) {

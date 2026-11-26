@@ -67,6 +67,18 @@ SCL_CUT = (
     'MHalVpeSclSetWaitDone',
 )
 
+# mhal JPE cut (--jpe): the 15 MHAL_JPE_* entry points that mi_venc imports
+# (through its codec ops table); inside mhal only jpe_probe calls
+# MHAL_JPE_CreateDevice/DestroyDevice. kernel/blobs/mhal_jpe_*.c has the prototypes
+JPE_CUT = (
+    'MHAL_JPE_BarrierOneFrame', 'MHAL_JPE_CheckInstanceStatus',
+    'MHAL_JPE_CreateDevice', 'MHAL_JPE_CreateInstance', 'MHAL_JPE_DestroyDevice',
+    'MHAL_JPE_DestroyInstance', 'MHAL_JPE_EncodeAddOutBuff', 'MHAL_JPE_EncodeCancel',
+    'MHAL_JPE_EncodeFrameDone', 'MHAL_JPE_EncodeOneFrame', 'MHAL_JPE_GetDevConfig',
+    'MHAL_JPE_GetEngStatus', 'MHAL_JPE_GetParam', 'MHAL_JPE_IsrProc',
+    'MHAL_JPE_QueryBufSize', 'MHAL_JPE_SetParam',
+)
+
 REMOVE = ('.gnu.linkonce.this_module', '.modinfo', '__versions',
           '__ksymtab', '__ksymtab_gpl', '__ksymtab_strings', '.pv_table')
 
@@ -334,6 +346,11 @@ def main():
                     'code gets the aliases __vendor_<name>, kernel/blobs/'
                     'mhal_vif_shim.c defines them and forwards; own: undefined, '
                     'kernel/blobs/mhal_vif_own.c implements them')
+    ap.add_argument('--jpe', choices=('vendor', 'shim'), default='vendor',
+                    help='mhal only: keep the blob JPE implementation (vendor); '
+                    'shim: the JPE_CUT entry points become undefined and the blob '
+                    'code gets the aliases __vendor_<name>, kernel/blobs/'
+                    'mhal_jpe_shim.c defines them and forwards')
     ap.add_argument('--objcopy', default=os.environ.get('CROSS_COMPILE', '') + 'objcopy')
     a = ap.parse_args()
 
@@ -394,7 +411,20 @@ def main():
                                    (s, elf.names[defined[s][0]], defined[s][1]))
             elf.undefine(s)
         exports = [s for s in exports if s not in SCL_CUT]
+    if a.name == 'mhal' and a.jpe != 'vendor':
+        defined = {n: (ndx, v) for _, n, v, _, _, ndx in elf.symbols() if ndx != SHN_UNDEF}
+        for s in JPE_CUT:
+            if s not in defined:
+                sys.exit('%s: no %s' % (a.ko, s))
+            if a.jpe == 'shim':
+                cmdq_rename.append('__vendor_%s=%s:%#x,global,function' %
+                                   (s, elf.names[defined[s][0]], defined[s][1]))
+            elf.undefine(s)
+        exports = [s for s in exports if s not in JPE_CUT]
+    pats = []
     if a.name == 'mhal' and a.vif == 'own':
+        pats += [(b'sstar,vif\0', b'osm,novif\0'), (b'sstar,csi\0', b'osm,nocsi\0')]
+    if pats:
         # the blob drivers of the vif and csi nodes must not bind: mhal_vif_own.c
         # drives the hardware. The compatible strings in the match tables (char
         # arrays in .rodata, or string literals) get a name no node has (same
@@ -403,7 +433,7 @@ def main():
             if not (name.startswith('.rodata') or name == '.data'):
                 continue
             off, size = elf.sh[i][4], elf.sh[i][5]
-            for old, new in ((b'sstar,vif\0', b'osm,novif\0'), (b'sstar,csi\0', b'osm,nocsi\0')):
+            for old, new in pats:
                 pos = elf.data.find(old, off, off + size)
                 while pos >= 0:
                     if pos == off or elf.data[pos - 1] == 0:

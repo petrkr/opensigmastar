@@ -30,3 +30,8 @@ endif
 ifeq ($(OSM_SCL),own)
 mhal-y += mhal_scl_own.o
 endif
+
+# mhal JPE shim (make JPE=shim, scripts/relink.py --jpe)
+ifeq ($(OSM_JPE),shim)
+mhal-y += mhal_jpe_shim.o
+endif

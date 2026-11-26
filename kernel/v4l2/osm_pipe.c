@@ -73,19 +73,40 @@ extern int MI_SYS_IMPL_SetChnOutputPortDepth(const void *port, u32 user, u32 buf
 extern int mi_sys_ChnOutputPortGetBufPa(const void *port, void *info, int *handle);
 extern int mi_sys_ChnOutputPortPutBuf(int handle);
 
+extern int MI_VENC_IMPL_Init(void);
+extern int MI_VENC_IMPL_DeInit(void);
+extern int MI_VENC_IMPL_CreateChn(u32 chn, const void *attr);
+extern int MI_VENC_IMPL_DestroyChn(u32 chn);
+extern int MI_VENC_IMPL_StartRecvPic(u32 chn);
+extern int MI_VENC_IMPL_StopRecvPic(u32 chn);
+extern int MI_VENC_IMPL_GetChnDevid(u32 chn, u32 *dev);
+extern int MI_VENC_IMPL_GetRingPoolHandle(u32 chn, u32 *handle);
+extern int MI_VENC_IMPL_GetChnAttr(u32 chn, void *attr);
+extern int MI_VENC_IMPL_SetChnAttr(u32 chn, const void *attr);
+extern int MI_VENC_IMPL_SetJpegParam(u32 chn, const void *param);
+extern int MI_VENC_IMPL_GetJpegParam(u32 chn, void *param);
+extern int MI_VENC_IMPL_RequestIdr(u32 chn, u8 instant);
+extern int MI_VENC_IMPL_Query(u32 chn, void *stat);
+extern int mi_sys_RingPool_GetHeadRecordTimeout(u32 handle, void *rec, u32 flag, u32 ms);
+extern int mi_sys_RingPool_ReleaseHeadRecord(u32 handle, u32 flag);
+extern int mi_sys_RingPool_GetRingPoolTotalSpace(u32 handle, void *info);
+
 #define MI_ERR_NOBUF		0xa009200d	/* no buffer on the port */
 
 /* enums of the MI API used here */
 #define MOD_VIF			6
 #define MOD_VPE			7
+#define MOD_VENC		2
 #define INTF_MIPI		4
 #define VIF_WORK_RGB_REALTIME	3
 #define EDGE_DOUBLE		2
 #define PIXFMT_YUV420SP		11
+#define PIXFMT_YUV422_YUYV	0
 #define PIXFMT_RGB_BAYER	20
 #define BAYER_END		12
 #define VPE_MODE_REALTIME	0x18
 #define LINK_REALTIME		4
+#define LINK_FRAMEBASE		1
 
 /* MI_SYS_ChnPort: module, device, channel, port */
 struct chn_port {
@@ -132,18 +153,34 @@ struct vpe_port_mode {
 	u32 pixfmt, compress;
 };
 
+#define VPE_PORT_NV12		0
+#define VPE_PORT_H264		1
+#define VPE_PORT_MJPEG		2
+
 struct pipe {
 	struct mutex lock;
-	bool up;
+	bool up;		/* sensor, VIF and the VPE channel run */
+	bool bound;		/* VIF -> VPE bound */
+	u32 ports;		/* VPE ports in use (bit per port) */
 	u32 snr;
 	struct chn_port vif, vpe;
-	bool isp_done;
+	struct mutex first_lock;
 	u32 frames;
 	struct mutex ctl_lock;	/* ctl_* below and ISP API access */
 	bool ctl_ready;		/* the 3A accepts API calls (after the bin) */
 	u32 ctl_mask;		/* values waiting for ctl_ready */
 	s32 ctl_val[OSM_CTRL_NUM];
-	int inits;		/* IMPL_Init calls done: 0..4 */
+	int inits;		/* IMPL_Init calls done: 0..5 */
+	/* encoder (one channel, bound to a VPE port of the same number) */
+	bool enc_on;
+	u32 enc_chn;		/* = VPE port */
+	u32 enc_dev;
+	u32 enc_ring;		/* ring pool handle of the channel */
+	u64 ring_base;		/* start of the ring pool memory (MIU address) */
+	u32 ring_size;
+	struct osm_enc_params enc;
+	u32 enc_fps_den;
+	bool enc_idr_wait;
 };
 
 static struct pipe pipe_state;
@@ -169,30 +206,19 @@ static int mi_check(const char *what, int ret)
 		goto fail;			\
 } while (0)
 
-static void pipe_down(struct pipe *p)
-{
-	int r;
-
 #define DOWN(what, call) do {			\
-	MI(r, call);				\
-	mi_check(what, r);			\
+	int _r;					\
+	MI(_r, call);				\
+	mi_check(what, _r);			\
 } while (0)
-	DOWN("VPE DisablePort", MI_VPE_DisablePort(0, 0));
-	DOWN("SYS UnBind", MI_SYS_IMPL_UnBindChnPort(&p->vif, &p->vpe));
-	DOWN("VPE StopChannel", MI_VPE_StopChannel(0));
-	DOWN("VPE DestroyChannel", MI_VPE_DestroyChannel(0));
-	DOWN("VIF DisableChnPort", MI_VIF_DisableChnPort(0, 0));
-	DOWN("VIF DisableDev", MI_VIF_DisableDev(0));
-	DOWN("SNR Disable", MI_SNR_IMPL_Disable(p->snr));
-#undef DOWN
-	p->up = false;
-}
 
 /* the "open" of the MI devices stays for the life of the module */
 static void pipe_deinit(struct pipe *p)
 {
 	int r;
 
+	if (p->inits > 4)
+		MI(r, MI_VENC_IMPL_DeInit());
 	if (p->inits > 3)
 		MI(r, MI_VPE_IMPL_DeInit());
 	if (p->inits > 2)
@@ -204,23 +230,21 @@ static void pipe_deinit(struct pipe *p)
 	p->inits = 0;
 }
 
-static int pipe_start(void *priv, u32 width, u32 height, u32 fps)
+/* p->lock held. Sensor, VIF and the VPE channel; the first port follows. */
+static int base_up(struct pipe *p, u32 width, u32 height, u32 fps)
 {
-	struct pipe *p = priv;
 	struct scratch {
 		u8 pad[256], plane[256], res[256];
 		struct vif_dev_attr dev;
 		struct vif_port_attr port;
 		struct vpe_chn_attr chn;
 		struct vpe_chn_param param;
-		struct vpe_port_mode pm;
 	} *sc;
 	u8 *pad, *plane, *res;
 	struct vif_dev_attr *dev;
 	struct vif_port_attr *port;
 	struct vpe_chn_attr *chn;
 	struct vpe_chn_param *param;
-	struct vpe_port_mode *pm;
 	u32 count = 0, i, pixfmt;
 	int idx = -1, ret;
 
@@ -234,17 +258,10 @@ static int pipe_start(void *priv, u32 width, u32 height, u32 fps)
 	port = &sc->port;
 	chn = &sc->chn;
 	param = &sc->param;
-	pm = &sc->pm;
 
-	mutex_lock(&p->lock);
-	if (p->up) {
-		ret = -EBUSY;
-		goto unlock;
-	}
 	p->snr = sensor;
 	p->vif = (struct chn_port){ MOD_VIF, 0, 0, 0 };
 	p->vpe = (struct chn_port){ MOD_VPE, 0, 0, 0 };
-	p->isp_done = false;
 	p->frames = 0;
 	mutex_lock(&p->ctl_lock);
 	p->ctl_ready = false;
@@ -261,6 +278,8 @@ static int pipe_start(void *priv, u32 width, u32 height, u32 fps)
 		p->inits = 3;
 		STEP(ret, "VPE Init", MI_VPE_IMPL_Init());
 		p->inits = 4;
+		STEP(ret, "VENC Init", MI_VENC_IMPL_Init());
+		p->inits = 5;
 	}
 	STEP(ret, "SNR SetPlaneMode", MI_SNR_IMPL_SetPlaneMode(p->snr, 0));
 	STEP(ret, "SNR QueryResCount", MI_SNR_IMPL_QueryResCount(p->snr, &count));
@@ -278,7 +297,7 @@ static int pipe_start(void *priv, u32 width, u32 height, u32 fps)
 	if (idx < 0) {
 		pr_err("osm_pipe: no sensor mode for %ux%u@%u\n", width, height, fps);
 		ret = -EINVAL;
-		goto unlock;
+		goto out;
 	}
 	STEP(ret, "SNR SetRes", MI_SNR_IMPL_SetRes(p->snr, idx));
 	STEP(ret, "SNR SetFps", MI_SNR_IMPL_SetFps(p->snr, fps));
@@ -322,23 +341,102 @@ static int pipe_start(void *priv, u32 width, u32 height, u32 fps)
 	param->level_3dnr = 1;
 	STEP(ret, "VPE SetChannelParam", MI_VPE_SetChannelParam(0, param));
 	STEP(ret, "VPE StartChannel", MI_VPE_StartChannel(0));
-
-	pm->w = width;
-	pm->h = height;
-	pm->pixfmt = PIXFMT_YUV420SP;
-	STEP(ret, "VPE SetPortMode", MI_VPE_SetPortMode(0, 0, pm));
-	STEP(ret, "VPE EnablePort", MI_VPE_EnablePort(0, 0));
-	STEP(ret, "SYS SetOutputDepth", MI_SYS_IMPL_SetChnOutputPortDepth(&p->vpe, 2, 4));
-	STEP(ret, "SYS Bind", MI_SYS_IMPL_BindChnPort2(&p->vif, &p->vpe, fps, fps,
-						       LINK_REALTIME, 0));
 	p->up = true;
 	ret = 0;
+	goto out;
+fail:
+	/* the steps above run in the order of the teardown below */
+	DOWN("VPE StopChannel", MI_VPE_StopChannel(0));
+	DOWN("VPE DestroyChannel", MI_VPE_DestroyChannel(0));
+	DOWN("VIF DisableChnPort", MI_VIF_DisableChnPort(0, 0));
+	DOWN("VIF DisableDev", MI_VIF_DisableDev(0));
+	DOWN("SNR Disable", MI_SNR_IMPL_Disable(p->snr));
+out:
+	kfree(sc);
+	return ret;
+}
+
+/* p->lock held, no VPE port in use any more */
+static void base_down(struct pipe *p)
+{
+	if (p->bound)
+		DOWN("SYS UnBind", MI_SYS_IMPL_UnBindChnPort(&p->vif, &p->vpe));
+	p->bound = false;
+	DOWN("VPE StopChannel", MI_VPE_StopChannel(0));
+	DOWN("VPE DestroyChannel", MI_VPE_DestroyChannel(0));
+	DOWN("VIF DisableChnPort", MI_VIF_DisableChnPort(0, 0));
+	DOWN("VIF DisableDev", MI_VIF_DisableDev(0));
+	DOWN("SNR Disable", MI_SNR_IMPL_Disable(p->snr));
+	p->up = false;
+}
+
+/* p->lock held, base up: enable one VPE output port */
+static int vpe_port_on(struct pipe *p, u32 port, u32 w, u32 h, u32 pixfmt, u32 fps)
+{
+	struct vpe_port_mode pm = { .w = w, .h = h, .pixfmt = pixfmt };
+	int ret;
+
+	STEP(ret, "VPE SetPortMode", MI_VPE_SetPortMode(0, port, &pm));
+	STEP(ret, "VPE EnablePort", MI_VPE_EnablePort(0, port));
+	p->ports |= BIT(port);
+	ret = 0;
+fail:
+	return ret;
+}
+
+static void vpe_port_off(struct pipe *p, u32 port)
+{
+	DOWN("VPE DisablePort", MI_VPE_DisablePort(0, port));
+	p->ports &= ~BIT(port);
+}
+
+/* p->lock held: connect the sensor to the VPE (after the first port) */
+static int vif_bind(struct pipe *p, u32 fps)
+{
+	int ret;
+
+	if (p->bound)
+		return 0;
+	STEP(ret, "SYS Bind", MI_SYS_IMPL_BindChnPort2(&p->vif, &p->vpe, fps, fps,
+						       LINK_REALTIME, 0));
+	p->bound = true;
+	ret = 0;
+fail:
+	return ret;
+}
+
+static int pipe_start(void *priv, u32 width, u32 height, u32 fps)
+{
+	struct pipe *p = priv;
+	bool was_up;
+	int ret;
+
+	mutex_lock(&p->lock);
+	if (p->ports & BIT(VPE_PORT_NV12)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	was_up = p->up;
+	if (!was_up) {
+		ret = base_up(p, width, height, fps);
+		if (ret)
+			goto unlock;
+	}
+	ret = vpe_port_on(p, VPE_PORT_NV12, width, height, PIXFMT_YUV420SP, fps);
+	if (ret)
+		goto fail;
+	STEP(ret, "SYS SetOutputDepth", MI_SYS_IMPL_SetChnOutputPortDepth(&p->vpe, 2, 4));
+	ret = vif_bind(p, fps);
+	if (ret)
+		goto fail;
 	goto unlock;
 fail:
-	pipe_down(p);
+	if (p->ports & BIT(VPE_PORT_NV12))
+		vpe_port_off(p, VPE_PORT_NV12);
+	if (!was_up && !p->ports)
+		base_down(p);
 unlock:
 	mutex_unlock(&p->lock);
-	kfree(sc);
 	return ret;
 }
 
@@ -346,12 +444,12 @@ static void pipe_stop(void *priv)
 {
 	struct pipe *p = priv;
 
-	mutex_lock(&p->ctl_lock);
-	p->ctl_ready = false;
-	mutex_unlock(&p->ctl_lock);
 	mutex_lock(&p->lock);
-	if (p->up)
-		pipe_down(p);
+	if (p->ports & BIT(VPE_PORT_NV12)) {
+		vpe_port_off(p, VPE_PORT_NV12);
+		if (!p->ports)
+			base_down(p);
+	}
 	mutex_unlock(&p->lock);
 }
 
@@ -394,6 +492,24 @@ static int copy_plane(const u8 *bi, int plane, void *dst, u32 w, u32 rows)
 }
 
 static void ctl_replay(struct pipe *p);
+
+/* the ISP channel exists once frames flow: load the tuning bin, replay controls */
+static void pipe_first_frame(struct pipe *p)
+{
+	if (p->ctl_ready)
+		return;
+	mutex_lock(&p->first_lock);
+	if (!p->ctl_ready) {
+		if (isp_bin[0]) {
+			int r = osm_isp_load_bin(0, isp_bin);
+
+			if (r)
+				pr_warn("osm_pipe: ISP bin %s: %d\n", isp_bin, r);
+		}
+		ctl_replay(p);
+	}
+	mutex_unlock(&p->first_lock);
+}
 
 static int pipe_read_frame(void *priv, void *dst, u32 size, u64 *ts_ns)
 {
@@ -440,15 +556,10 @@ static int pipe_read_frame(void *priv, void *dst, u32 size, u64 *ts_ns)
 		MI(r, mi_sys_ChnOutputPortPutBuf(handle));
 	}
 	*ts_ns = 0;
-	if (!ret && !p->frames++ && isp_bin[0]) {
-		/* the ISP channel exists once frames flow */
-		int r = osm_isp_load_bin(0, isp_bin);
-
-		if (r)
-			pr_warn("osm_pipe: ISP bin %s: %d\n", isp_bin, r);
+	if (!ret) {
+		p->frames++;
+		pipe_first_frame(p);
 	}
-	if (!ret && p->frames && !p->ctl_ready)
-		ctl_replay(p);
 out:
 	kfree(info);
 	return ret;
@@ -633,6 +744,301 @@ out:
 	return ret;
 }
 
+/*
+ * Encoder: a VPE port feeds an MI_VENC channel of the same number (SYS
+ * bind, frame based), the channel writes access units into a ring pool of
+ * mi_sys. libmi_venc reads the pool through the ioctls; the kernel
+ * callers use the same mi_sys ring pool functions: the handle comes from
+ * MI_VENC_IMPL_GetRingPoolHandle(), the head record (flags u64 at 0,
+ * timestamp u64 at 8, address u64 at 0x20, length u32 at 0x2c, all in a
+ * 0x48 byte structure) is the next piece of data, and is released after
+ * the copy.
+ */
+#define ENC_CHN_ATTR_SIZE	76
+#define ENC_CODEC_H264		2
+#define ENC_CODEC_MJPEG		4
+#define ENC_RC_H264_CBR		1
+#define ENC_RC_MJPEG_QP		7
+#define ENC_PROFILE_HIGH	2
+#define RING_REC_SIZE		0x48
+#define RING_INFO_SIZE		0x48
+#define MIU0_BASE_PHYS		0x20000000UL
+
+static uint dump_recs;
+module_param(dump_recs, uint, 0644);
+MODULE_PARM_DESC(dump_recs, "log the ring pool record and first bytes of the first N encoder units");
+
+static void enc_build_attr(const struct osm_enc_params *e, u32 *w)
+{
+	memset(w, 0, ENC_CHN_ATTR_SIZE);
+	/* attribute union at word 1, rate control mode at word 10 */
+	if (e->codec == OSM_CODEC_H264) {
+		w[0] = ENC_CODEC_H264;
+		w[1] = e->width;		/* max size */
+		w[2] = e->height;
+		w[3] = e->width * e->height;	/* stream buffer */
+		w[4] = ENC_PROFILE_HIGH;
+		w[5] = 1;			/* by frame */
+		w[6] = e->width;
+		w[7] = e->height;
+		w[8] = 0;			/* B frames */
+		w[9] = 1;			/* reference frames */
+		w[10] = ENC_RC_H264_CBR;
+		w[11] = e->gop;
+		w[12] = 1;			/* stat time (s) */
+		w[13] = e->fps;
+		w[14] = 1;
+		w[15] = e->bitrate;
+		w[16] = 1;			/* average level */
+	} else {
+		w[0] = ENC_CODEC_MJPEG;
+		w[1] = e->width;
+		w[2] = e->height;
+		w[3] = e->width * e->height;
+		w[4] = 1;			/* by frame */
+		w[5] = e->width;
+		w[6] = e->height;
+		w[10] = ENC_RC_MJPEG_QP;
+		w[11] = e->fps;
+		w[12] = 1;
+		w[13] = e->quality;
+	}
+}
+
+/* p->lock held */
+static void enc_teardown(struct pipe *p)
+{
+	struct chn_port vpe_port = { MOD_VPE, 0, 0, p->enc_chn };
+	struct chn_port venc = { MOD_VENC, p->enc_dev, p->enc_chn, 0 };
+
+	DOWN("VENC StopRecvPic", MI_VENC_IMPL_StopRecvPic(p->enc_chn));
+	DOWN("SYS UnBind (VENC)", MI_SYS_IMPL_UnBindChnPort(&vpe_port, &venc));
+	DOWN("VENC DestroyChn", MI_VENC_IMPL_DestroyChn(p->enc_chn));
+	vpe_port_off(p, p->enc_chn);
+	p->enc_on = false;
+}
+
+static int enc_start(void *priv, const struct osm_enc_params *e)
+{
+	struct pipe *p = priv;
+	struct chn_port vpe_port, venc;
+	bool was_up;
+	u32 attr[ENC_CHN_ATTR_SIZE / 4 + 4];
+	u32 port = e->codec == OSM_CODEC_H264 ? VPE_PORT_H264 : VPE_PORT_MJPEG;
+	int ret;
+
+	mutex_lock(&p->lock);
+	if (p->enc_on) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	was_up = p->up;
+	if (!was_up) {
+		ret = base_up(p, e->width, e->height, e->fps);
+		if (ret)
+			goto unlock;
+	}
+	ret = vpe_port_on(p, port, e->width, e->height,
+			  e->codec == OSM_CODEC_H264 ? PIXFMT_YUV420SP : PIXFMT_YUV422_YUYV,
+			  e->fps);
+	if (ret)
+		goto fail;
+	p->enc_chn = port;
+	p->enc = *e;
+	enc_build_attr(e, attr);
+	STEP(ret, "VENC CreateChn", MI_VENC_IMPL_CreateChn(p->enc_chn, attr));
+	p->enc_on = true;	/* teardown on failure covers the channel */
+	STEP(ret, "VENC GetChnDevid", MI_VENC_IMPL_GetChnDevid(p->enc_chn, &p->enc_dev));
+	vpe_port = (struct chn_port){ MOD_VPE, 0, 0, p->enc_chn };
+	venc = (struct chn_port){ MOD_VENC, p->enc_dev, p->enc_chn, 0 };
+	STEP(ret, "SYS Bind (VENC)", MI_SYS_IMPL_BindChnPort2(&vpe_port, &venc, e->fps,
+							       e->fps, LINK_FRAMEBASE, 0));
+	STEP(ret, "VENC StartRecvPic", MI_VENC_IMPL_StartRecvPic(p->enc_chn));
+	p->enc_ring = 0;	/* the pool exists once the first frame arrived */
+	p->enc_idr_wait = true;
+	ret = vif_bind(p, e->fps);
+	if (ret)
+		goto fail;
+	goto unlock;
+fail:
+	if (p->enc_on)
+		enc_teardown(p);
+	else if (p->ports & BIT(port))
+		vpe_port_off(p, port);
+	if (!was_up && !p->ports)
+		base_down(p);
+unlock:
+	mutex_unlock(&p->lock);
+	return ret;
+}
+
+static void enc_stop(void *priv)
+{
+	struct pipe *p = priv;
+
+	mutex_lock(&p->lock);
+	if (p->enc_on) {
+		enc_teardown(p);
+		if (!p->ports)
+			base_down(p);
+	}
+	mutex_unlock(&p->lock);
+}
+
+static u8 *ring_va(struct pipe *p, u64 addr)
+{
+	unsigned long pa = addr >= MIU0_BASE_PHYS ? addr : addr + MIU0_BASE_PHYS;
+
+	return __va(pa);
+}
+
+/* Annex B access unit starts an IDR picture: SPS or IDR slice before any other slice */
+static bool h264_is_idr(const u8 *d, u32 n)
+{
+	u32 i, end = min(n, 128u);
+
+	for (i = 0; i + 3 < end; i++) {
+		u8 nal;
+
+		if (d[i] || d[i + 1] || d[i + 2] != 1)
+			continue;
+		nal = d[i + 3] & 0x1f;
+		if (nal == 5 || nal == 7)
+			return true;
+		if (nal == 1)
+			return false;
+	}
+	return false;
+}
+
+static int enc_read(void *priv, void *dst, u32 size, u32 *len, u32 *flags, u64 *ts_ns)
+{
+	struct pipe *p = priv;
+	u8 *rec;
+	u64 addr;
+	u32 n, h;
+	int ret;
+
+	rec = kzalloc(RING_REC_SIZE, GFP_KERNEL);
+	if (!rec)
+		return -ENOMEM;
+	if (!p->enc_ring) {
+		/*
+		 * The channel creates its ring pool with the first frame; asking
+		 * earlier makes the vendor code log an error. Query: word 4 =
+		 * packs ready.
+		 */
+		u32 st[16] = {};
+		int tries;
+
+		for (tries = 0; tries < 10; tries++) {
+			MI(ret, MI_VENC_IMPL_Query(p->enc_chn, st));
+			if (!ret && st[4])
+				break;
+			msleep(10);
+		}
+		if (ret || !st[4]) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		MI(ret, MI_VENC_IMPL_GetRingPoolHandle(p->enc_chn, &p->enc_ring));
+		if (ret || !p->enc_ring) {
+			p->enc_ring = 0;
+			ret = -EAGAIN;
+			goto out;
+		}
+		MI(ret, mi_sys_RingPool_GetRingPoolTotalSpace(p->enc_ring, rec));
+		if (!ret) {
+			p->ring_base = *(u64 *)(rec + 0x20);
+			p->ring_size = *(u32 *)(rec + 0x2c);
+		}
+		pr_info("osm_pipe: venc chn %u dev %u ring %u base 0x%llx size %u (%d)\n",
+			p->enc_chn, p->enc_dev, p->enc_ring, p->ring_base, p->ring_size, ret);
+		memset(rec, 0, RING_REC_SIZE);
+	}
+	h = p->enc_ring;
+	MI(ret, mi_sys_RingPool_GetHeadRecordTimeout(h, rec, 1, 100));
+	if (ret) {
+		static int once;
+
+		if (!once++)
+			pr_info("osm_pipe: ring GetHeadRecord 0x%x\n", ret);
+		ret = -EAGAIN;
+		goto out;
+	}
+	addr = *(u64 *)(rec + 0x20);
+	n = *(u32 *)(rec + 0x2c);
+	if (dump_recs) {
+		dump_recs--;
+		print_hex_dump(KERN_INFO, "osm_pipe rec: ", DUMP_PREFIX_OFFSET, 16, 4, rec,
+			       RING_REC_SIZE, false);
+		pr_info("osm_pipe: unit addr 0x%llx len %u\n", addr, n);
+		print_hex_dump(KERN_INFO, "osm_pipe data: ", DUMP_PREFIX_OFFSET, 16, 1,
+			       ring_va(p, addr), min(n, 64u), true);
+	}
+	*ts_ns = 0;
+	*flags = 0;
+	if (n > size) {
+		ret = -ENOSPC;
+	} else {
+		unsigned long pa = (unsigned long)ring_va(p, addr);
+
+		dma_sync_single_for_cpu(osm_msys_device(), __pa(pa), n, DMA_FROM_DEVICE);
+		memcpy(dst, (void *)pa, n);
+		*len = n;
+		if (p->enc.codec == OSM_CODEC_MJPEG || h264_is_idr(dst, n))
+			*flags = OSM_AU_KEY;
+		ret = 0;
+	}
+	{
+		int r;
+
+		MI(r, mi_sys_RingPool_ReleaseHeadRecord(h, 0));
+	}
+	if (!ret)
+		pipe_first_frame(p);
+out:
+	kfree(rec);
+	return ret;
+}
+
+static int enc_set(void *priv, enum osm_enc_ctrl id, s32 val)
+{
+	struct pipe *p = priv;
+	int ret = 0;
+
+	mutex_lock(&p->lock);
+	if (!p->enc_on) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (id == OSM_ENC_IDR) {
+		MI(ret, MI_VENC_IMPL_RequestIdr(p->enc_chn, 1));
+		ret = mi_check("VENC RequestIdr", ret);
+		goto out;
+	}
+	if (id == OSM_ENC_BITRATE)
+		p->enc.bitrate = val;
+	else if (id == OSM_ENC_GOP)
+		p->enc.gop = val;
+	else if (id == OSM_ENC_QUALITY)
+		p->enc.quality = val;
+	else {
+		ret = -EINVAL;
+		goto out;
+	}
+	{
+		u32 attr[ENC_CHN_ATTR_SIZE / 4 + 4];
+
+		enc_build_attr(&p->enc, attr);
+		MI(ret, MI_VENC_IMPL_SetChnAttr(p->enc_chn, attr));
+		ret = mi_check("VENC SetChnAttr", ret);
+	}
+out:
+	mutex_unlock(&p->lock);
+	return ret;
+}
+
 static const struct osm_v4l2_backend pipe_be = {
 	.name = "osm_pipe (vendor MI)",
 	.priv = &pipe_state,
@@ -641,6 +1047,10 @@ static const struct osm_v4l2_backend pipe_be = {
 	.read_frame = pipe_read_frame,
 	.set_ctrl = pipe_set_ctrl,
 	.get_ctrl = pipe_get_ctrl,
+	.enc_start = enc_start,
+	.enc_stop = enc_stop,
+	.enc_read = enc_read,
+	.enc_set = enc_set,
 };
 
 static struct osm_v4l2_backend be;
@@ -649,6 +1059,7 @@ static int __init osm_pipe_init(void)
 {
 	mutex_init(&pipe_state.lock);
 	mutex_init(&pipe_state.ctl_lock);
+	mutex_init(&pipe_state.first_lock);
 	be = pipe_be;
 	be.owner = THIS_MODULE;
 	return osm_v4l2_register(&be);

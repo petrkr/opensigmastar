@@ -33,6 +33,30 @@ enum osm_flicker {
 	OSM_FLICKER_AUTO,
 };
 
+/* compressed capture (encoder node), see enc_* in struct osm_v4l2_backend */
+enum osm_codec {
+	OSM_CODEC_H264,		/* Annex B access units, SPS/PPS in front of each IDR */
+	OSM_CODEC_MJPEG,	/* one JPEG per access unit */
+};
+
+enum osm_enc_ctrl {
+	OSM_ENC_BITRATE,	/* bit/s (H.264 and MJPEG rate control) */
+	OSM_ENC_GOP,		/* frames between IDR pictures (H.264) */
+	OSM_ENC_QUALITY,	/* JPEG quality 1..100 (MJPEG) */
+	OSM_ENC_IDR,		/* request an IDR picture now (value ignored) */
+	OSM_ENC_NUM
+};
+
+struct osm_enc_params {
+	enum osm_codec codec;
+	u32 width, height, fps;
+	u32 bitrate;		/* bit/s */
+	u32 gop;		/* frames */
+	u32 quality;		/* 1..100, MJPEG */
+};
+
+#define OSM_AU_KEY	BIT(0)	/* IDR picture (H.264), always set for MJPEG */
+
 /*
  * Backend of the osm_v4l2 capture device (osm_pipe.ko registers one).
  * Split in two modules because a module that uses symbols of the
@@ -64,6 +88,19 @@ struct osm_v4l2_backend {
 	 */
 	int (*set_ctrl)(void *priv, enum osm_ctrl id, s32 val);
 	int (*get_ctrl)(void *priv, enum osm_ctrl id, s32 *val);
+	/*
+	 * Compressed stream. Independent of start()/stop(): the backend
+	 * brings the shared pipeline up for whichever user comes first and
+	 * down with the last one. enc_read() copies the next access unit
+	 * (one frame) into dst, sets *len, *flags (OSM_AU_*), *ts_ns like
+	 * read_frame(); -EAGAIN after about 200 ms without data, -ENOSPC when
+	 * the unit does not fit (it is dropped).
+	 */
+	int (*enc_start)(void *priv, const struct osm_enc_params *par);
+	void (*enc_stop)(void *priv);
+	int (*enc_read)(void *priv, void *dst, u32 size, u32 *len, u32 *flags,
+			u64 *ts_ns);
+	int (*enc_set)(void *priv, enum osm_enc_ctrl id, s32 val);
 };
 
 int osm_v4l2_register(const struct osm_v4l2_backend *be);

@@ -13,3 +13,22 @@ mi_vif MI_VIF_IMPL_Init
 mi_vif MI_VIF_IMPL_DeInit
 mi_vpe MI_VPE_IMPL_Init
 mi_vpe MI_VPE_IMPL_DeInit
+# encoder channel API for the compressed V4L2 node (same arguments as the
+# MI_VENC_* ioctl handlers pass: channel, then the structure)
+mi_venc MI_VENC_IMPL_Init
+mi_venc MI_VENC_IMPL_DeInit
+mi_venc MI_VENC_IMPL_CreateChn
+mi_venc MI_VENC_IMPL_DestroyChn
+mi_venc MI_VENC_IMPL_StartRecvPic
+mi_venc MI_VENC_IMPL_StopRecvPic
+mi_venc MI_VENC_IMPL_GetChnDevid
+mi_venc MI_VENC_IMPL_GetRingPoolHandle
+mi_venc MI_VENC_IMPL_GetChnAttr
+mi_venc MI_VENC_IMPL_SetChnAttr
+mi_venc MI_VENC_IMPL_GetRcParam
+mi_venc MI_VENC_IMPL_SetRcParam
+mi_venc MI_VENC_IMPL_GetJpegParam
+mi_venc MI_VENC_IMPL_SetJpegParam
+mi_venc MI_VENC_IMPL_RequestIdr
+mi_venc MI_VENC_IMPL_EnableIdr
+mi_venc MI_VENC_IMPL_Query

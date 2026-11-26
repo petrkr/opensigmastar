@@ -5,7 +5,9 @@
  * This module is only the V4L2/videobuf2 front: one video node,
  * NV12 1920x1080, vb2 vmalloc buffers filled by a kernel thread from the
  * backend (osm_pipe: sensor -> VIF -> VPE ISP + SCL over the vendor MI
- * modules). The front uses GPL-only symbols and therefore must not link to
+ * modules). A second node offers the hardware encoder like a UVC camera:
+ * one access unit per buffer, H.264 (Annex B) or MJPEG selected with
+ * VIDIOC_S_FMT, both at 1920x1080@20. The front uses GPL-only symbols and therefore must not link to
  * any module that uses the proprietary vendor modules; the backend
  * registers itself through osm_v4l2_register() (see osm_v4l2.h).
  */
@@ -30,6 +32,7 @@
 #define OSM_HEIGHT	1080
 #define OSM_FPS		20
 #define OSM_SIZE	(OSM_WIDTH * OSM_HEIGHT * 3 / 2)
+#define OSM_ENC_SIZE	(1024 * 1024)	/* largest access unit */
 
 static int video_nr = -1;
 module_param(video_nr, int, 0444);
@@ -40,113 +43,191 @@ struct osm_buf {
 	struct list_head list;
 };
 
-struct osm_dev {
-	struct platform_device *pdev;
-	struct v4l2_device v4l2;
+struct osm_dev;
+
+/* one video node: NV12 (enc false) or compressed (enc true) */
+struct osm_node {
+	struct osm_dev *d;
+	bool enc;
 	struct video_device vdev;
 	struct vb2_queue q;
-	struct v4l2_ctrl_handler hdl;
-	struct v4l2_ctrl *c_auto, *c_exp, *c_gain, *c_bias, *c_plf;
-	s32 exp_set, gain_set;	/* values for the fixed modes, 100 us / 1024 = 1x */
 	struct mutex lock;		/* ioctls, queue */
-	struct mutex be_lock;		/* backend (un)registration */
-	const struct osm_v4l2_backend *be;
 	spinlock_t qlock;		/* bufs */
 	struct list_head bufs;
 	wait_queue_head_t wq;
 	struct task_struct *thread;
 	u32 sequence;
+};
+
+struct osm_dev {
+	struct platform_device *pdev;
+	struct v4l2_device v4l2;
+	struct osm_node node[2];	/* 0: NV12, 1: compressed */
+	struct v4l2_ctrl_handler hdl;	/* image controls (node 0) */
+	struct v4l2_ctrl *c_auto, *c_exp, *c_gain, *c_bias, *c_plf;
+	s32 exp_set, gain_set;	/* values for the fixed modes, 100 us / 1024 = 1x */
+	struct v4l2_ctrl_handler ehdl;	/* encoder controls (node 1) */
+	struct v4l2_ctrl *c_bitrate, *c_gop, *c_quality, *c_idr;
+	u32 codec_fmt;			/* V4L2_PIX_FMT_H264 or _MJPEG */
+	struct mutex be_lock;		/* backend (un)registration, start/stop */
+	const struct osm_v4l2_backend *be;
 	bool registered;
 };
 
 static struct osm_dev *odev;
 
+/* the backend pipeline runs (either node streams); be_lock held */
+static bool osm_streaming(struct osm_dev *d)
+{
+	return d->node[0].thread || d->node[1].thread;
+}
+
+static struct osm_buf *osm_take_buf(struct osm_node *n)
+{
+	struct osm_buf *b;
+
+	wait_event_interruptible(n->wq, kthread_should_stop() || !list_empty(&n->bufs));
+	if (kthread_should_stop())
+		return NULL;
+	spin_lock_irq(&n->qlock);
+	b = list_first_entry_or_null(&n->bufs, struct osm_buf, list);
+	if (b)
+		list_del(&b->list);
+	spin_unlock_irq(&n->qlock);
+	return b;
+}
+
+static void osm_put_back(struct osm_node *n, struct osm_buf *b, int ret)
+{
+	/* nothing yet: keep the buffer for the next try */
+	spin_lock_irq(&n->qlock);
+	list_add(&b->list, &n->bufs);
+	spin_unlock_irq(&n->qlock);
+	if (ret != -EAGAIN) {
+		pr_warn_ratelimited("osm_v4l2: read: %d\n", ret);
+		msleep(20);
+	}
+}
+
 static int osm_thread(void *data)
 {
-	struct osm_dev *d = data;
+	struct osm_node *n = data;
+	struct osm_dev *d = n->d;
 	const struct osm_v4l2_backend *be = d->be;
 
 	while (!kthread_should_stop()) {
-		struct osm_buf *b = NULL;
+		struct osm_buf *b = osm_take_buf(n);
 		u64 ts = 0;
 		int ret;
 
-		wait_event_interruptible(d->wq, kthread_should_stop() ||
-					 !list_empty(&d->bufs));
-		if (kthread_should_stop())
-			break;
-		spin_lock_irq(&d->qlock);
-		b = list_first_entry_or_null(&d->bufs, struct osm_buf, list);
-		if (b)
-			list_del(&b->list);
-		spin_unlock_irq(&d->qlock);
 		if (!b)
 			continue;
-
 		ret = be->read_frame(be->priv, vb2_plane_vaddr(&b->vb.vb2_buf, 0),
 				     OSM_SIZE, &ts);
 		if (ret) {
-			/* nothing yet: keep the buffer for the next try */
-			spin_lock_irq(&d->qlock);
-			list_add(&b->list, &d->bufs);
-			spin_unlock_irq(&d->qlock);
-			if (ret != -EAGAIN) {
-				pr_warn_ratelimited("osm_v4l2: read_frame: %d\n", ret);
-				msleep(20);
-			}
+			osm_put_back(n, b, ret);
 			continue;
 		}
 		vb2_set_plane_payload(&b->vb.vb2_buf, 0, OSM_SIZE);
 		b->vb.vb2_buf.timestamp = ts ? ts : ktime_get_ns();
-		b->vb.sequence = d->sequence++;
+		b->vb.sequence = n->sequence++;
 		b->vb.field = V4L2_FIELD_NONE;
 		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	}
 	return 0;
 }
 
+/* encoder node: one access unit per buffer */
+static int osm_enc_thread(void *data)
+{
+	struct osm_node *n = data;
+	struct osm_dev *d = n->d;
+	const struct osm_v4l2_backend *be = d->be;
+
+	while (!kthread_should_stop()) {
+		struct osm_buf *b = osm_take_buf(n);
+		u32 len = 0, flags = 0;
+		u64 ts = 0;
+		int ret;
+
+		if (!b)
+			continue;
+		ret = be->enc_read(be->priv, vb2_plane_vaddr(&b->vb.vb2_buf, 0),
+				   vb2_plane_size(&b->vb.vb2_buf, 0), &len, &flags, &ts);
+		if (ret == -ENOSPC) {
+			/* the unit was dropped by the backend: report nothing, retry */
+			pr_warn_ratelimited("osm_v4l2: access unit does not fit the buffer\n");
+			osm_put_back(n, b, -EAGAIN);
+			continue;
+		}
+		if (ret) {
+			osm_put_back(n, b, ret);
+			continue;
+		}
+		vb2_set_plane_payload(&b->vb.vb2_buf, 0, len);
+		b->vb.vb2_buf.timestamp = ts ? ts : ktime_get_ns();
+		b->vb.sequence = n->sequence++;
+		b->vb.field = V4L2_FIELD_NONE;
+		b->vb.flags &= ~(V4L2_BUF_FLAG_KEYFRAME | V4L2_BUF_FLAG_PFRAME);
+		b->vb.flags |= flags & OSM_AU_KEY ? V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
+		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	}
+	return 0;
+}
+
+static u32 osm_size(struct osm_node *n)
+{
+	return n->enc ? OSM_ENC_SIZE : OSM_SIZE;
+}
+
 static int osm_queue_setup(struct vb2_queue *q, unsigned int *nbufs,
 			   unsigned int *nplanes, unsigned int sizes[],
 			   struct device *alloc_devs[])
 {
+	struct osm_node *n = vb2_get_drv_priv(q);
+
 	if (*nplanes)
-		return sizes[0] < OSM_SIZE ? -EINVAL : 0;
+		return sizes[0] < osm_size(n) ? -EINVAL : 0;
 	*nplanes = 1;
-	sizes[0] = OSM_SIZE;
+	sizes[0] = osm_size(n);
 	return 0;
 }
 
 static int osm_buf_prepare(struct vb2_buffer *vb)
 {
-	if (vb2_plane_size(vb, 0) < OSM_SIZE)
+	struct osm_node *n = vb2_get_drv_priv(vb->vb2_queue);
+
+	if (vb2_plane_size(vb, 0) < osm_size(n))
 		return -EINVAL;
-	vb2_set_plane_payload(vb, 0, OSM_SIZE);
+	/* the encoder sets the payload itself */
+	if (!n->enc)
+		vb2_set_plane_payload(vb, 0, OSM_SIZE);
 	return 0;
 }
 
 static void osm_buf_queue(struct vb2_buffer *vb)
 {
-	struct osm_dev *d = vb2_get_drv_priv(vb->vb2_queue);
+	struct osm_node *n = vb2_get_drv_priv(vb->vb2_queue);
 	struct osm_buf *b = container_of(to_vb2_v4l2_buffer(vb), struct osm_buf, vb);
 	unsigned long flags;
 
-	spin_lock_irqsave(&d->qlock, flags);
-	list_add_tail(&b->list, &d->bufs);
-	spin_unlock_irqrestore(&d->qlock, flags);
-	wake_up(&d->wq);
+	spin_lock_irqsave(&n->qlock, flags);
+	list_add_tail(&b->list, &n->bufs);
+	spin_unlock_irqrestore(&n->qlock, flags);
+	wake_up(&n->wq);
 }
 
-static void osm_return_bufs(struct osm_dev *d, enum vb2_buffer_state st)
+static void osm_return_bufs(struct osm_node *n, enum vb2_buffer_state st)
 {
-	struct osm_buf *b, *n;
+	struct osm_buf *b, *t;
 	unsigned long flags;
 
-	spin_lock_irqsave(&d->qlock, flags);
-	list_for_each_entry_safe(b, n, &d->bufs, list) {
+	spin_lock_irqsave(&n->qlock, flags);
+	list_for_each_entry_safe(b, t, &n->bufs, list) {
 		list_del(&b->list);
 		vb2_buffer_done(&b->vb.vb2_buf, st);
 	}
-	spin_unlock_irqrestore(&d->qlock, flags);
+	spin_unlock_irqrestore(&n->qlock, flags);
 }
 
 
@@ -226,7 +307,7 @@ static int osm_s_ctrl(struct v4l2_ctrl *c)
 
 	/* the handler has its own lock; be_lock orders this against start/stop */
 	mutex_lock(&d->be_lock);
-	if (!d->thread) {
+	if (!osm_streaming(d)) {
 		/* not streaming: osm_replay_ctrls() applies the values at the start */
 		if (c->id == V4L2_CID_EXPOSURE_AUTO) {
 			if (d->c_exp->is_new)
@@ -261,7 +342,7 @@ static int osm_g_volatile_ctrl(struct v4l2_ctrl *c)
 	int ret;
 
 	mutex_lock(&d->be_lock);
-	if (!d->thread) {
+	if (!osm_streaming(d)) {
 		mutex_unlock(&d->be_lock);
 		return 0;	/* keep the stored values */
 	}
@@ -330,7 +411,8 @@ static int osm_init_ctrls(struct osm_dev *d)
 
 static int osm_start_streaming(struct vb2_queue *q, unsigned int count)
 {
-	struct osm_dev *d = vb2_get_drv_priv(q);
+	struct osm_node *n = vb2_get_drv_priv(q);
+	struct osm_dev *d = n->d;
 	int ret;
 
 	mutex_lock(&d->be_lock);
@@ -338,16 +420,31 @@ static int osm_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -ENODEV;
 		goto err;
 	}
-	ret = d->be->start(d->be->priv, OSM_WIDTH, OSM_HEIGHT, OSM_FPS);
+	if (n->enc) {
+		struct osm_enc_params par = {
+			.codec = d->codec_fmt == V4L2_PIX_FMT_MJPEG ? OSM_CODEC_MJPEG : OSM_CODEC_H264,
+			.width = OSM_WIDTH, .height = OSM_HEIGHT, .fps = OSM_FPS,
+			.bitrate = d->c_bitrate->val, .gop = d->c_gop->val,
+			.quality = d->c_quality->val,
+		};
+
+		ret = d->be->enc_start(d->be->priv, &par);
+	} else {
+		ret = d->be->start(d->be->priv, OSM_WIDTH, OSM_HEIGHT, OSM_FPS);
+	}
 	if (ret)
 		goto put;
 	osm_replay_ctrls(d);
-	d->sequence = 0;
-	d->thread = kthread_run(osm_thread, d, "osm_v4l2");
-	if (IS_ERR(d->thread)) {
-		ret = PTR_ERR(d->thread);
-		d->thread = NULL;
-		d->be->stop(d->be->priv);
+	n->sequence = 0;
+	n->thread = kthread_run(n->enc ? osm_enc_thread : osm_thread, n,
+				n->enc ? "osm_v4l2_enc" : "osm_v4l2");
+	if (IS_ERR(n->thread)) {
+		ret = PTR_ERR(n->thread);
+		n->thread = NULL;
+		if (n->enc)
+			d->be->enc_stop(d->be->priv);
+		else
+			d->be->stop(d->be->priv);
 		goto put;
 	}
 	mutex_unlock(&d->be_lock);
@@ -356,23 +453,27 @@ put:
 	module_put(d->be->owner);
 err:
 	mutex_unlock(&d->be_lock);
-	osm_return_bufs(d, VB2_BUF_STATE_QUEUED);
+	osm_return_bufs(n, VB2_BUF_STATE_QUEUED);
 	return ret;
 }
 
 static void osm_stop_streaming(struct vb2_queue *q)
 {
-	struct osm_dev *d = vb2_get_drv_priv(q);
+	struct osm_node *n = vb2_get_drv_priv(q);
+	struct osm_dev *d = n->d;
 
 	mutex_lock(&d->be_lock);
-	if (d->thread) {
-		kthread_stop(d->thread);
-		d->thread = NULL;
-		d->be->stop(d->be->priv);
+	if (n->thread) {
+		kthread_stop(n->thread);
+		n->thread = NULL;
+		if (n->enc)
+			d->be->enc_stop(d->be->priv);
+		else
+			d->be->stop(d->be->priv);
 		module_put(d->be->owner);
 	}
 	mutex_unlock(&d->be_lock);
-	osm_return_bufs(d, VB2_BUF_STATE_ERROR);
+	osm_return_bufs(n, VB2_BUF_STATE_ERROR);
 }
 
 static const struct vb2_ops osm_vb2_ops = {
@@ -416,6 +517,56 @@ static int osm_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
+/* encoder node: the format selects the codec */
+static int osm_enc_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
+{
+	static const u32 fmts[] = { V4L2_PIX_FMT_H264, V4L2_PIX_FMT_MJPEG };
+
+	if (f->index >= ARRAY_SIZE(fmts))
+		return -EINVAL;
+	f->pixelformat = fmts[f->index];
+	f->flags = V4L2_FMT_FLAG_COMPRESSED;
+	return 0;
+}
+
+static void osm_enc_fill_fmt(struct v4l2_pix_format *p, u32 fmt)
+{
+	p->width = OSM_WIDTH;
+	p->height = OSM_HEIGHT;
+	p->pixelformat = fmt;
+	p->field = V4L2_FIELD_NONE;
+	p->bytesperline = 0;
+	p->sizeimage = OSM_ENC_SIZE;
+	p->colorspace = V4L2_COLORSPACE_REC709;
+}
+
+static int osm_enc_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	struct osm_node *n = video_drvdata(file);
+
+	osm_enc_fill_fmt(&f->fmt.pix, n->d->codec_fmt);
+	return 0;
+}
+
+static int osm_enc_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	u32 fmt = f->fmt.pix.pixelformat;
+
+	osm_enc_fill_fmt(&f->fmt.pix, fmt == V4L2_PIX_FMT_MJPEG ? fmt : V4L2_PIX_FMT_H264);
+	return 0;
+}
+
+static int osm_enc_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
+{
+	struct osm_node *n = video_drvdata(file);
+
+	osm_enc_try_fmt(file, priv, f);
+	if (f->fmt.pix.pixelformat != n->d->codec_fmt && vb2_is_busy(&n->q))
+		return -EBUSY;
+	n->d->codec_fmt = f->fmt.pix.pixelformat;
+	return 0;
+}
+
 static int osm_enum_input(struct file *file, void *priv, struct v4l2_input *i)
 {
 	if (i->index)
@@ -439,7 +590,12 @@ static int osm_s_input(struct file *file, void *priv, unsigned int i)
 static int osm_enum_framesizes(struct file *file, void *priv,
 			       struct v4l2_frmsizeenum *fs)
 {
-	if (fs->index || fs->pixel_format != V4L2_PIX_FMT_NV12)
+	struct osm_node *n = video_drvdata(file);
+	bool ok = n->enc ? (fs->pixel_format == V4L2_PIX_FMT_H264 ||
+			    fs->pixel_format == V4L2_PIX_FMT_MJPEG)
+			 : fs->pixel_format == V4L2_PIX_FMT_NV12;
+
+	if (fs->index || !ok)
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 	fs->discrete.width = OSM_WIDTH;
@@ -450,8 +606,12 @@ static int osm_enum_framesizes(struct file *file, void *priv,
 static int osm_enum_frameintervals(struct file *file, void *priv,
 				   struct v4l2_frmivalenum *fi)
 {
-	if (fi->index || fi->pixel_format != V4L2_PIX_FMT_NV12 ||
-	    fi->width != OSM_WIDTH || fi->height != OSM_HEIGHT)
+	struct osm_node *n = video_drvdata(file);
+	bool ok = n->enc ? (fi->pixel_format == V4L2_PIX_FMT_H264 ||
+			    fi->pixel_format == V4L2_PIX_FMT_MJPEG)
+			 : fi->pixel_format == V4L2_PIX_FMT_NV12;
+
+	if (fi->index || !ok || fi->width != OSM_WIDTH || fi->height != OSM_HEIGHT)
 		return -EINVAL;
 	fi->type = V4L2_FRMIVAL_TYPE_DISCRETE;
 	fi->discrete.numerator = 1;
@@ -470,28 +630,39 @@ static int osm_g_parm(struct file *file, void *priv, struct v4l2_streamparm *p)
 	return 0;
 }
 
+#define OSM_COMMON_IOCTLS						\
+	.vidioc_querycap = osm_querycap,				\
+	.vidioc_enum_input = osm_enum_input,				\
+	.vidioc_g_input = osm_g_input,					\
+	.vidioc_s_input = osm_s_input,					\
+	.vidioc_enum_framesizes = osm_enum_framesizes,			\
+	.vidioc_enum_frameintervals = osm_enum_frameintervals,		\
+	.vidioc_g_parm = osm_g_parm,					\
+	.vidioc_s_parm = osm_g_parm,					\
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,				\
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,			\
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,			\
+	.vidioc_querybuf = vb2_ioctl_querybuf,				\
+	.vidioc_qbuf = vb2_ioctl_qbuf,					\
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,				\
+	.vidioc_expbuf = vb2_ioctl_expbuf,				\
+	.vidioc_streamon = vb2_ioctl_streamon,				\
+	.vidioc_streamoff = vb2_ioctl_streamoff
+
 static const struct v4l2_ioctl_ops osm_ioctl_ops = {
-	.vidioc_querycap = osm_querycap,
+	OSM_COMMON_IOCTLS,
 	.vidioc_enum_fmt_vid_cap = osm_enum_fmt,
 	.vidioc_g_fmt_vid_cap = osm_g_fmt,
 	.vidioc_s_fmt_vid_cap = osm_g_fmt,
 	.vidioc_try_fmt_vid_cap = osm_g_fmt,
-	.vidioc_enum_input = osm_enum_input,
-	.vidioc_g_input = osm_g_input,
-	.vidioc_s_input = osm_s_input,
-	.vidioc_enum_framesizes = osm_enum_framesizes,
-	.vidioc_enum_frameintervals = osm_enum_frameintervals,
-	.vidioc_g_parm = osm_g_parm,
-	.vidioc_s_parm = osm_g_parm,
-	.vidioc_reqbufs = vb2_ioctl_reqbufs,
-	.vidioc_create_bufs = vb2_ioctl_create_bufs,
-	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
-	.vidioc_querybuf = vb2_ioctl_querybuf,
-	.vidioc_qbuf = vb2_ioctl_qbuf,
-	.vidioc_dqbuf = vb2_ioctl_dqbuf,
-	.vidioc_expbuf = vb2_ioctl_expbuf,
-	.vidioc_streamon = vb2_ioctl_streamon,
-	.vidioc_streamoff = vb2_ioctl_streamoff,
+};
+
+static const struct v4l2_ioctl_ops osm_enc_ioctl_ops = {
+	OSM_COMMON_IOCTLS,
+	.vidioc_enum_fmt_vid_cap = osm_enc_enum_fmt,
+	.vidioc_g_fmt_vid_cap = osm_enc_g_fmt,
+	.vidioc_s_fmt_vid_cap = osm_enc_s_fmt,
+	.vidioc_try_fmt_vid_cap = osm_enc_try_fmt,
 };
 
 static const struct v4l2_file_operations osm_fops = {
@@ -503,6 +674,65 @@ static const struct v4l2_file_operations osm_fops = {
 	.unlocked_ioctl = video_ioctl2,
 	.mmap = vb2_fop_mmap,
 };
+
+/*
+ * Encoder controls. Set while streaming they go to the backend at once,
+ * otherwise the values are read when the stream starts.
+ */
+#define OSM_BITRATE_MIN		100000
+#define OSM_BITRATE_MAX		16000000
+#define OSM_BITRATE_DEF		4000000
+#define OSM_GOP_MAX		250
+#define OSM_GOP_DEF		40
+
+static int osm_enc_s_ctrl(struct v4l2_ctrl *c)
+{
+	struct osm_dev *d = container_of(c->handler, struct osm_dev, ehdl);
+	const struct osm_v4l2_backend *be = d->be;
+	int ret = 0;
+
+	mutex_lock(&d->be_lock);
+	if (!d->node[1].thread) {
+		mutex_unlock(&d->be_lock);
+		return 0;
+	}
+	switch (c->id) {
+	case V4L2_CID_MPEG_VIDEO_BITRATE:
+		ret = be->enc_set(be->priv, OSM_ENC_BITRATE, c->val);
+		break;
+	case V4L2_CID_MPEG_VIDEO_GOP_SIZE:
+		ret = be->enc_set(be->priv, OSM_ENC_GOP, c->val);
+		break;
+	case V4L2_CID_JPEG_COMPRESSION_QUALITY:
+		ret = be->enc_set(be->priv, OSM_ENC_QUALITY, c->val);
+		break;
+	case V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME:
+		ret = be->enc_set(be->priv, OSM_ENC_IDR, 0);
+		break;
+	}
+	mutex_unlock(&d->be_lock);
+	return ret;
+}
+
+static const struct v4l2_ctrl_ops osm_enc_ctrl_ops = {
+	.s_ctrl = osm_enc_s_ctrl,
+};
+
+static int osm_init_enc_ctrls(struct osm_dev *d)
+{
+	struct v4l2_ctrl_handler *h = &d->ehdl;
+
+	v4l2_ctrl_handler_init(h, 4);
+	d->c_bitrate = v4l2_ctrl_new_std(h, &osm_enc_ctrl_ops, V4L2_CID_MPEG_VIDEO_BITRATE,
+					 OSM_BITRATE_MIN, OSM_BITRATE_MAX, 1000, OSM_BITRATE_DEF);
+	d->c_gop = v4l2_ctrl_new_std(h, &osm_enc_ctrl_ops, V4L2_CID_MPEG_VIDEO_GOP_SIZE,
+				     1, OSM_GOP_MAX, 1, OSM_GOP_DEF);
+	d->c_quality = v4l2_ctrl_new_std(h, &osm_enc_ctrl_ops, V4L2_CID_JPEG_COMPRESSION_QUALITY,
+					 1, 100, 1, 80);
+	d->c_idr = v4l2_ctrl_new_std(h, &osm_enc_ctrl_ops, V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME,
+				     0, 0, 0, 0);
+	return h->error;
+}
 
 int osm_v4l2_register(const struct osm_v4l2_backend *be)
 {
@@ -537,20 +767,62 @@ void osm_v4l2_unregister(const struct osm_v4l2_backend *be)
 }
 EXPORT_SYMBOL(osm_v4l2_unregister);
 
+static int osm_init_node(struct osm_dev *d, int idx, int nr)
+{
+	struct osm_node *n = &d->node[idx];
+	struct vb2_queue *q = &n->q;
+	int ret;
+
+	n->d = d;
+	n->enc = idx == 1;
+	mutex_init(&n->lock);
+	spin_lock_init(&n->qlock);
+	INIT_LIST_HEAD(&n->bufs);
+	init_waitqueue_head(&n->wq);
+
+	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	q->io_modes = VB2_MMAP | VB2_READ | VB2_USERPTR | VB2_DMABUF;
+	q->drv_priv = n;
+	q->buf_struct_size = sizeof(struct osm_buf);
+	q->ops = &osm_vb2_ops;
+	q->mem_ops = &vb2_vmalloc_memops;
+	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	q->min_queued_buffers = 1;
+	q->lock = &n->lock;
+	q->dev = &d->pdev->dev;
+	ret = vb2_queue_init(q);
+	if (ret)
+		return ret;
+
+	strscpy(n->vdev.name, n->enc ? "osm_v4l2 compressed" : "osm_v4l2", sizeof(n->vdev.name));
+	n->vdev.fops = &osm_fops;
+	n->vdev.ioctl_ops = n->enc ? &osm_enc_ioctl_ops : &osm_ioctl_ops;
+	n->vdev.release = video_device_release_empty;
+	n->vdev.v4l2_dev = &d->v4l2;
+	n->vdev.ctrl_handler = n->enc ? &d->ehdl : &d->hdl;
+	n->vdev.queue = q;
+	n->vdev.lock = &n->lock;
+	n->vdev.vfl_dir = VFL_DIR_RX;
+	n->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING | V4L2_CAP_READWRITE;
+	video_set_drvdata(&n->vdev, n);
+	ret = video_register_device(&n->vdev, VFL_TYPE_VIDEO, nr);
+	if (ret)
+		return ret;
+	pr_info("osm_v4l2: /dev/video%d (%s)\n", n->vdev.num,
+		n->enc ? "H.264/MJPEG" : "NV12");
+	return 0;
+}
+
 static int __init osm_v4l2_init(void)
 {
 	struct osm_dev *d;
-	struct vb2_queue *q;
 	int ret;
 
 	d = kzalloc(sizeof(*d), GFP_KERNEL);
 	if (!d)
 		return -ENOMEM;
-	mutex_init(&d->lock);
 	mutex_init(&d->be_lock);
-	spin_lock_init(&d->qlock);
-	INIT_LIST_HEAD(&d->bufs);
-	init_waitqueue_head(&d->wq);
+	d->codec_fmt = V4L2_PIX_FMT_H264;
 
 	d->pdev = platform_device_register_simple("osm_v4l2", -1, NULL, 0);
 	if (IS_ERR(d->pdev)) {
@@ -565,44 +837,24 @@ static int __init osm_v4l2_init(void)
 	ret = osm_init_ctrls(d);
 	if (ret)
 		goto err_ctrls;
-
-	q = &d->q;
-	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	q->io_modes = VB2_MMAP | VB2_READ | VB2_USERPTR | VB2_DMABUF;
-	q->drv_priv = d;
-	q->buf_struct_size = sizeof(struct osm_buf);
-	q->ops = &osm_vb2_ops;
-	q->mem_ops = &vb2_vmalloc_memops;
-	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	q->min_queued_buffers = 1;
-	q->lock = &d->lock;
-	q->dev = &d->pdev->dev;
-	ret = vb2_queue_init(q);
+	ret = osm_init_enc_ctrls(d);
 	if (ret)
-		goto err_v4l2;
+		goto err_ctrls;
 
-	strscpy(d->vdev.name, "osm_v4l2", sizeof(d->vdev.name));
-	d->vdev.fops = &osm_fops;
-	d->vdev.ioctl_ops = &osm_ioctl_ops;
-	d->vdev.release = video_device_release_empty;
-	d->vdev.v4l2_dev = &d->v4l2;
-	d->vdev.ctrl_handler = &d->hdl;
-	d->vdev.queue = q;
-	d->vdev.lock = &d->lock;
-	d->vdev.vfl_dir = VFL_DIR_RX;
-	d->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
-			      V4L2_CAP_READWRITE;
-	video_set_drvdata(&d->vdev, d);
-	ret = video_register_device(&d->vdev, VFL_TYPE_VIDEO, video_nr);
+	ret = osm_init_node(d, 0, video_nr);
 	if (ret)
-		goto err_v4l2;
+		goto err_ctrls;
 	d->registered = true;
+	ret = osm_init_node(d, 1, video_nr < 0 ? -1 : video_nr + 1);
+	if (ret)
+		goto err_node0;
 	odev = d;
-	pr_info("osm_v4l2: /dev/video%d\n", d->vdev.num);
 	return 0;
-err_v4l2:
-	v4l2_ctrl_handler_free(&d->hdl);
+err_node0:
+	video_unregister_device(&d->node[0].vdev);
 err_ctrls:
+	v4l2_ctrl_handler_free(&d->hdl);
+	v4l2_ctrl_handler_free(&d->ehdl);
 	v4l2_device_unregister(&d->v4l2);
 err_pdev:
 	platform_device_unregister(d->pdev);
@@ -616,8 +868,10 @@ static void __exit osm_v4l2_exit(void)
 	struct osm_dev *d = odev;
 
 	odev = NULL;
-	video_unregister_device(&d->vdev);
+	video_unregister_device(&d->node[1].vdev);
+	video_unregister_device(&d->node[0].vdev);
 	v4l2_ctrl_handler_free(&d->hdl);
+	v4l2_ctrl_handler_free(&d->ehdl);
 	v4l2_device_unregister(&d->v4l2);
 	platform_device_unregister(d->pdev);
 	kfree(d);

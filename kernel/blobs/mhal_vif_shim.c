@@ -18,6 +18,7 @@
 #include <linux/atomic.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/printk.h>
 #include <linux/moduleparam.h>
 
 static int vtrace = 6;
@@ -36,7 +37,7 @@ module_param(vtrace, int, 0644);
 	X(MHal_VIF_StopMCU, 1) X(MHal_VIF_SubChnQuery, 1) \
 	X(MHal_Vif_GetSensorFrmCnt64, 1) \
 	X(DrvVif_ChnID2DevID, 0) X(DrvVif_Dev2ChnID, 0) X(DrvVif_GetDev2SNRPadID, 0) \
-	X(DrvVif_GetSensorFrmCnt64, 0) X(DrvVif_Init, 0) X(DrvVif_InputMask, 0) \
+	X(DrvVif_GetSensorFrmCnt64, 0) X(DrvVif_Init, 0) X(DrvVif_IntGet, 0) X(DrvVif_InputMask, 0) \
 	X(DrvVif_InputMaskFrameSync, 0) X(DrvVif_QueryMCLK, 0) \
 	X(DrvVif_SNRPad2DevID, 0) X(DrvVif_SensorPdwn, 0) X(DrvVif_SensorReset, 0) \
 	X(DrvVif_SetDev2SNRPadMap, 0) X(DrvVif_SetLineCntHit_MaskChange, 0) \
@@ -69,6 +70,8 @@ static atomic_t cnt[NFUNC];
 		if (k <= vtrace) \
 			pr_info("vif: %u %s(%#lx, %#lx, %#lx, %#lx, %#lx) = %#llx\n", \
 				jiffies_to_msecs(jiffies), #n, a, b, c, d, f, r); \
+		if (k <= vtrace && (I_##n == I_MHal_VIF_DevSetConfig || I_##n == I_MHal_VIF_ChnSetConfig) && b > 0xbf000000) \
+			print_hex_dump(KERN_INFO, "vif: cfg ", DUMP_PREFIX_NONE, 32, 4, (void *)b, 56, false); \
 		return r; \
 	}
 VIF_FUNCS

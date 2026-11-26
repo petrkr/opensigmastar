@@ -45,7 +45,7 @@ VIF_CUT = (
     'MHal_VIF_SetVIFDev2SensorPadMux', 'MHal_VIF_StopMCU',
     'MHal_VIF_SubChnQuery', 'MHal_Vif_GetSensorFrmCnt64',
     'DrvVif_ChnID2DevID', 'DrvVif_Dev2ChnID', 'DrvVif_GetDev2SNRPadID',
-    'DrvVif_GetSensorFrmCnt64', 'DrvVif_Init', 'DrvVif_InputMask',
+    'DrvVif_GetSensorFrmCnt64', 'DrvVif_Init', 'DrvVif_IntGet', 'DrvVif_InputMask',
     'DrvVif_InputMaskFrameSync', 'DrvVif_QueryMCLK', 'DrvVif_SNRPad2DevID',
     'DrvVif_SensorPdwn', 'DrvVif_SensorReset', 'DrvVif_SetDev2SNRPadMap',
     'DrvVif_SetLineCntHit_MaskChange', 'DrvVif_SetMclk',
@@ -365,6 +365,21 @@ def main():
                                    (s, elf.names[defined[s][0]], defined[s][1]))
             elf.undefine(s)
         exports = [s for s in exports if s not in VIF_CUT]
+    if a.name == 'mhal' and a.vif == 'own':
+        # the blob drivers of the vif and csi nodes must not bind: mhal_vif_own.c
+        # drives the hardware. The compatible strings in the match tables (char
+        # arrays in .rodata, or string literals) get a name no node has (same
+        # length, strings are only patched whole)
+        for i, name in enumerate(elf.names):
+            if not (name.startswith('.rodata') or name == '.data'):
+                continue
+            off, size = elf.sh[i][4], elf.sh[i][5]
+            for old, new in ((b'sstar,vif\0', b'osm,novif\0'), (b'sstar,csi\0', b'osm,nocsi\0')):
+                pos = elf.data.find(old, off, off + size)
+                while pos >= 0:
+                    if pos == off or elf.data[pos - 1] == 0:
+                        elf.data[pos:pos + len(old)] = new
+                    pos = elf.data.find(old, pos + 1, off + size)
     license = modinfo(elf, 'license') or 'Proprietary'
     desc = modinfo(elf, 'description') or '%s (vendor module)' % a.name
 
@@ -404,7 +419,11 @@ def main():
         f.write(WRAP.format(
             src=os.path.basename(a.ko), name=a.name, license=license, desc=desc,
             exit_decl='void osm_%s_blob_exit(void);\n' % a.name if has_exit else '',
-            exit_def=EXIT.format(name=a.name) if has_exit else '',
+            exit_def=(EXIT.format(name=a.name).replace(
+                'osm_mhal_blob_exit();', 'osm_vif_exit();\n\tosm_mhal_blob_exit();')
+                .replace('static void __exit', 'void osm_vif_exit(void);\nstatic void __exit', 1)
+                if a.name == 'mhal' and a.vif == 'own' else EXIT.format(name=a.name))
+            if has_exit else '',
             exports=''.join('extern char %s[];\nEXPORT_SYMBOL(%s);\n' % (s, s)
                             for s in exports) +
             (MHAL_RIU_STUB if a.name == 'mhal' else '')))

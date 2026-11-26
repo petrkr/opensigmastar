@@ -115,6 +115,19 @@ static int isp_get(u32 ch, u32 id, u32 size, void *buf)
 	return ret;
 }
 
+/* ISP API access for other modules (osm_pipe controls): size = API struct size */
+int osm_isp_api_set(u32 ch, u32 id, u32 size, void *buf)
+{
+	return isp_set(ch, id, size, buf);
+}
+EXPORT_SYMBOL(osm_isp_api_set);
+
+int osm_isp_api_get(u32 ch, u32 id, u32 size, void *buf)
+{
+	return isp_get(ch, id, size, buf);
+}
+EXPORT_SYMBOL(osm_isp_api_get);
+
 static int isp_bin_apply(u32 ch, const u8 *d, size_t n)
 {
 	const struct isp_bin_hdr *h = (const void *)d;
@@ -270,6 +283,34 @@ static int dump_set(const char *val, const struct kernel_param *kp)
 static const struct kernel_param_ops dump_ops = { .set = dump_set };
 module_param_cb(dump, &dump_ops, NULL, 0200);
 MODULE_PARM_DESC(dump, "debug: write \"ch id size\" to log the kernel's ISP API data");
+
+/* debug: write "ch id w0 w1 ..." (32-bit words, size = 4 * words) to set API data */
+static int put_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int ch, id, n = 0, w;
+	u32 buf[16];
+	int off, len = 0, ret;
+
+	if (sscanf(val, "%u %i %n", &ch, &id, &len) < 2 || !len)
+		return -EINVAL;
+	off = len;
+	while (n < ARRAY_SIZE(buf)) {
+		len = 0;
+		if (sscanf(val + off, "%i %n", &w, &len) < 1 || !len)
+			break;
+		buf[n++] = w;
+		off += len;
+	}
+	if (!n)
+		return -EINVAL;
+	ret = isp_set(ch, id, n * 4, buf);
+	pr_info("osm_isp: set ch %u id 0x%x size %u: 0x%x\n", ch, id, n * 4, ret);
+	return ret ? -EIO : 0;
+}
+
+static const struct kernel_param_ops put_ops = { .set = put_set };
+module_param_cb(put, &put_ops, NULL, 0200);
+MODULE_PARM_DESC(put, "debug: write \"ch id word...\" to set ISP API data");
 
 static const struct kernel_param_ops load_ops = { .set = load_set };
 module_param_cb(load, &load_ops, NULL, 0200);

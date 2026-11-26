@@ -16,7 +16,8 @@
 #             (mainline imx415.ko + osm_snr_v4l2.ko proxy plug-in, needs the
 #             in-tree media modules and imx415 in the module dir)
 #        V4L2 = 1: also load the V4L2 capture device (osm_v4l2 + osm_pipe,
-#             /dev/video0, NV12 1920x1080, the pipeline starts on STREAMON;
+#             /dev/video0 NV12 and /dev/video1 H.264 or MJPEG (VIDIOC_S_FMT),
+#             both 1920x1080, the pipeline starts on STREAMON;
 #             needs the in-tree media modules in the module dir and
 #             $FW/imx415.bin, default 0). Do not run a userspace MI
 #             application at the same time.

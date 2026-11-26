@@ -1,0 +1,15 @@
+# Blob-internal functions exported to the osm_* modules (in addition to what
+# the vendor module exports), see scripts/relink.py --extra-exports.
+# <module> <fnmatch pattern>
+mi_sensor MI_SNR_IMPL_*
+mi_sys MI_SYS_IMPL_BindChnPort2
+mi_sys MI_SYS_IMPL_UnBindChnPort
+mi_sys MI_SYS_IMPL_SetChnOutputPortDepth
+# the per-process init/exit the MI device layer runs when a process opens
+# /dev/mi_*; osm_pipe plays that process
+mi_sys MI_SYS_IMPL_Init
+mi_sys MI_SYS_IMPL_Exit
+mi_vif MI_VIF_IMPL_Init
+mi_vif MI_VIF_IMPL_DeInit
+mi_vpe MI_VPE_IMPL_Init
+mi_vpe MI_VPE_IMPL_DeInit

@@ -17,7 +17,7 @@ all: modules
 
 relink:
 	for b in $(BLOBS); do \
-		$(PYTHON) scripts/relink.py --map kernel/compat/redefine.map --symvers $(KDIR)/Module.symvers \
+		$(PYTHON) scripts/relink.py --map kernel/compat/redefine.map --symvers $(KDIR)/Module.symvers --extra-exports scripts/relink.exports \
 			$(VENDOR)/$$b.ko $$(basename $$b) kernel/blobs || exit 1; \
 	done
 

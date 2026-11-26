@@ -21,6 +21,7 @@ blob through the compat entry helpers, and the exports of the blob.
 """
 
 import argparse
+import fnmatch
 import os
 import struct
 import subprocess
@@ -276,6 +277,8 @@ def main():
     ap.add_argument('--pv-offset', type=lambda x: int(x, 0), default=0x60000000,
                     help='PHYS_OFFSET - PAGE_OFFSET (default %(default)#x)')
     ap.add_argument('--symvers', help='kernel Module.symvers, its exports are not re-exported')
+    ap.add_argument('--extra-exports', help='file: "<module> <fnmatch pattern>" lines, '
+                    'defined symbols of the blob to export in addition to its own exports')
     ap.add_argument('--objcopy', default=os.environ.get('CROSS_COMPILE', '') + 'objcopy')
     a = ap.parse_args()
 
@@ -288,6 +291,15 @@ def main():
         kernel = {l.split('\t')[1] for l in open(a.symvers)}
         exports = [s for s in exports if s not in kernel]
     names = {s[1] for s in elf.symbols() if s[5] != SHN_UNDEF}
+    if a.extra_exports:
+        pats = []
+        for l in open(a.extra_exports):
+            f = l.split('#')[0].split()
+            if len(f) == 2 and f[0] == a.name:
+                pats.append(f[1])
+        for n in sorted(names):
+            if any(fnmatch.fnmatchcase(n, p) for p in pats) and n not in exports:
+                exports.append(n)
     if 'init_module' not in names:
         sys.exit('no init_module in %s' % a.ko)
     has_exit = 'cleanup_module' in names

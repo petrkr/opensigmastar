@@ -51,7 +51,10 @@ static const char *const fname[NFUNC] = {
 };
 
 static atomic_t cnt[NFUNC];
+static atomic_t chk_ret[256];
 static int port1log = 6;
+static int p1diff;
+module_param(p1diff, int, 0644);
 module_param(port1log, int, 0644);
 
 /* register snapshots of the banks 0x1200..0x123f: the calls that change registers are
@@ -97,6 +100,7 @@ static void dump_arg(const char *fn, int i, unsigned long v)
 	long long n(long a, long b, long c, long d, long f, long g) \
 	{ \
 		long long r; \
+		bool p1d; \
 		int k = atomic_inc_return(&cnt[I_##n]); \
 		if (k <= scltrace) { \
 			pr_info("scl: %u >%s(%#lx, %#lx, %#lx, %#lx, %#lx)\n", \
@@ -109,9 +113,14 @@ static void dump_arg(const char *fn, int i, unsigned long v)
 			pr_info("scl: port1 Process %u buf:\n", jiffies_to_msecs(jiffies)); \
 			print_hex_dump(KERN_INFO, "scl:  ", DUMP_PREFIX_OFFSET, 32, 4, (void *)c, 0xe0, false); \
 		} \
+		p1d = I_##n == I_MHalVpeSclProcess && c >= PAGE_OFFSET && c < (unsigned long)high_memory - 512 && \
+		      ((u8 *)c)[0xd8] && p1diff > 0; \
+		if (p1d) { p1diff--; snap_diff("P1Process", k, true, true); } \
 		if (scldiff && k <= scldiff) snap_diff(#n, k, true, true); \
 		r = __vendor_##n(a, b, c, d, f, g); \
 		if (scldiff && k <= scldiff) snap_diff(#n, k, true, false); \
+		if (p1d) snap_diff("P1Process", k, true, false); \
+		if (I_##n == I_MHalVpeSclCheckIrq) atomic_inc(&chk_ret[(u32)r & 0xff]); \
 		if (k <= scltrace) { \
 			pr_info("scl: %u <%s = %#llx\n", jiffies_to_msecs(jiffies), #n, r); \
 			if (I_##n == I_MHalVpeCreateSclInstance && c >= PAGE_OFFSET && c < (unsigned long)high_memory) \
@@ -143,6 +152,9 @@ static int dump_set(const char *val, const struct kernel_param *kp)
 	for (i = 0; i < NFUNC; i++)
 		if (atomic_read(&cnt[i]))
 			pr_info("scl: %-34s %d\n", fname[i], atomic_read(&cnt[i]));
+	for (i = 0; i < 256; i++)
+		if (atomic_read(&chk_ret[i]))
+			pr_info("scl: CheckIrq ret %#x x %d\n", i, atomic_read(&chk_ret[i]));
 	return 0;
 }
 

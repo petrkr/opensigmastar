@@ -167,6 +167,7 @@ static struct {
 	u32 frame;
 	bool in_ok, crop_ok, size_ok, dma_ok;
 	bool p1_dma, p1_size;
+	u16 in_w, in_h, out_w, out_h;
 	bool warned;
 } c;
 
@@ -245,8 +246,10 @@ int MHalVpeSclCheckIrq(const u32 *h)
 
 	if (pend & 0x10)
 		ret |= 1;
-	if (pend & 0x04)
+	if (pend & 0x04) {
 		ret |= 2;
+		w16m(0x1211b4, 0, 0xf);	/* port 1 request flag, set by the frame program */
+	}
 	if (pend & 0x8000)
 		ret |= 8;
 	if (sclown_log && (r16(0x121828) & 0x180) && lg++ < 20)
@@ -287,6 +290,8 @@ int MHalVpeSclPortSizeConfig(void *ctx, const u32 *cfg)
 		c.p1_size = true;
 	else
 		c.size_ok = true;
+	c.out_w = cfg[1] & 0xffff;
+	c.out_h = cfg[1] >> 16;
 	return 1;
 }
 EXPORT_SYMBOL(MHalVpeSclPortSizeConfig);
@@ -306,8 +311,11 @@ EXPORT_SYMBOL(MHalVpeSclDmaPortConfig);
 /* arg 2 = height << 16 | width of the input window */
 int MHalVpeSclPreCropConfig(void *ctx, const u32 *cfg, u32 size)
 {
-	if (size == 0x08700f00)
+	if (size == 0x08700f00) {
 		c.crop_ok = true;
+		c.in_w = size & 0xffff;
+		c.in_h = size >> 16;
+	}
 	else if (!(size == 1 && cfg[9] == 0x780 && cfg[10] == 0x438))	/* port crop window */
 		return unsupported("input other than 3840x2160");
 	return 1;
@@ -319,6 +327,52 @@ int MHalVpeSclPortMirrorFlipConfig(void *ctx, const u32 *cfg)
 	return unsupported("mirror/flip");
 }
 EXPORT_SYMBOL(MHalVpeSclPortMirrorFlipConfig);
+
+
+/* Fill the size dependent registers of a program from the configuration: the template holds
+ * the verified 3840x2160 -> 1920x1080 values, the registers below carry the input window
+ * (0xf00 x 0x870 in the template) or the port output size (0x780 x 0x438). Scale ratio =
+ * in << 18 / out [A: only the 2:1 case is verified], 24 bit in two registers (+0x2 = low,
+ * +0x4 = high byte), horizontal at 0x1210/1211 + 0x02, vertical at + 0x06. */
+static void fix_sizes(struct scl_reg *p, int n, bool port1)
+{
+	u32 rh = ((u32)c.in_w << 18) / c.out_w, rv = ((u32)c.in_h << 18) / c.out_h;
+	int i;
+
+	for (i = 0; i < n; i++) {
+		u32 a = p[i].addr;
+		bool wreg = false, hreg = false;
+
+		switch (a) {
+		case 0x121902: case 0x121908: case 0x121040: case 0x121912: case 0x121918: case 0x121140:
+		case 0x121240: case 0x121932: case 0x121938: case 0x121434: case 0x1213c4: case 0x121144:
+		case 0x121044: case 0x121334: case 0x1215a8: case 0x1215b4: case 0x1215b0:
+			wreg = true;
+			break;
+		case 0x121904: case 0x12190c: case 0x121042: case 0x121914: case 0x12191c: case 0x121142:
+		case 0x121242: case 0x121934: case 0x12193c: case 0x121436: case 0x1213c6: case 0x121146:
+		case 0x121046: case 0x121336:
+			hreg = true;
+			break;
+		case 0x121002: p[i].val = rh; break;
+		case 0x121004: p[i].val = rh >> 16; break;
+		case 0x121006: p[i].val = rv; break;
+		case 0x121008: p[i].val = rv >> 16; break;
+		case 0x121102: case 0x121104: case 0x121106: case 0x121108:
+			if (port1) {	/* same scale as port 0: both ports are 1920x1080 */
+				u32 r = a == 0x121102 || a == 0x121104 ? rh : rv;
+
+				p[i].val = (a == 0x121104 || a == 0x121108) ? r >> 16 : r;
+			}
+			break;
+		}
+		/* template sizes: input 0xf00 x 0x870, port output 0x780 x 0x438 */
+		if (wreg)
+			p[i].val = p[i].val == 0x0f00 ? c.in_w : c.out_w;
+		if (hreg)
+			p[i].val = p[i].val == 0x0870 ? c.in_h : c.out_h;
+	}
+}
 
 /* buf: u64 Y address @0, u64 UV address @8 (MIU offsets, 8 byte units in the registers) */
 int MHalVpeSclProcess(void *ctx, void *q, const u32 *buf, int n)
@@ -333,6 +387,8 @@ int MHalVpeSclProcess(void *ctx, void *q, const u32 *buf, int n)
 	if (!(c.in_ok && c.crop_ok && c.size_ok && c.dma_ok))
 		return unsupported("a configuration other than the verified one");
 	c.frame++;
+	w16m(0x1210b0, 0, 1);		/* direct writes of the frame bookkeeping, as the vendor Process */
+	w16m(0x1210ba, c.frame, 0xffff);
 	memcpy(p0, prog0, sizeof(p0));
 	if (((const u8 *)buf)[0xd8]) {	/* second port enabled in this frame */
 		if (!(c.p1_dma && c.p1_size))
@@ -343,6 +399,7 @@ int MHalVpeSclProcess(void *ctx, void *q, const u32 *buf, int n)
 	if (sclown_log && src == prog1b && sclown_log-- > 0)
 		pr_info("scl: frame %u port1 y %#x uv1 %#x\n", c.frame, buf[0x70 / 4], buf[0x78 / 4]);
 	memcpy(p1, src, n1 * sizeof(p1[0]));
+	fix_sizes(p1, n1, src == prog1b);
 	for (i = 0; i < ARRAY_SIZE(p0); i++)
 		if (p0[i].addr == 0x1210b4)
 			p0[i].val = c.frame;

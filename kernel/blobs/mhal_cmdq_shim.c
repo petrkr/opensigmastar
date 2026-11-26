@@ -27,6 +27,8 @@ module_param(ntrace, int, 0644);
 
 static int arrlog = -1;			/* engine id whose Multi arrays are dumped (-1 none) */
 module_param(arrlog, int, 0644);
+static int arrmin;			/* dump only arrays with at least this many entries */
+module_param(arrmin, int, 0644);
 
 typedef long (*fn6)(long, long, long, long, long, long);
 
@@ -127,14 +129,22 @@ static long tramp(int w, long a, long b, long c, long d, long e, long f)
 	if (atomic_inc_return(&if_log[id][w]) <= ntrace) {
 		long r = ((fn6)ifc[id].orig[w])(a, b, c, d, e, f);
 
-		if (id == arrlog && (w == 7 || w == 9) && b && c > 0 && c <= 2000) {
+		if (id == arrlog && (w == 7 || w == 9) && b && c >= arrmin && c > 0 && c <= 128) {
+			/* only the entries that differ from the previous array of the same size (slots by size) */
+			static u32 prev[8][128][2];
+			static int prev_n[8];
 			u32 *p = (u32 *)b;
-			int i;
+			int i, sl = c == 1 ? 0 : c == 2 ? 1 : c == 3 ? 2 : c == 7 ? 3 : c == 113 ? 4 : c == 121 ? 5 : 6;
+			int full = prev_n[sl] != c;
 
-			for (i = 0; i < c; i++)
-				pr_info("cmdq: id %d %s[%d] addr %#x val %#x%s%04x\n", id, if_name[w], i,
-					p[2 * i], p[2 * i + 1] & 0xffff, w == 7 ? " mask " : " pad ",
-					p[2 * i + 1] >> 16);
+			for (i = 0; i < c; i++) {
+				if (full || memcmp(prev[sl][i], &p[2 * i], 8))
+					pr_info("cmdq: id %d %s[%d] addr %#x val %#x%s%04x (n %ld)\n", id, if_name[w], i,
+						p[2 * i], p[2 * i + 1] & 0xffff, w == 7 ? " mask " : " pad ",
+						p[2 * i + 1] >> 16, c);
+				memcpy(prev[sl][i], &p[2 * i], 8);
+			}
+			prev_n[sl] = c;
 		}
 		pr_info("cmdq: %llu id %d %s(%#lx, %#lx, %#lx, %#lx, %#lx) = %#lx\n",
 			(u64)jiffies_to_msecs(jiffies), id, if_name[w], b, c, d, e, f, r);

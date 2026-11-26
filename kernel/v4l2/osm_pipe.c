@@ -139,6 +139,10 @@ struct pipe {
 	struct chn_port vif, vpe;
 	bool isp_done;
 	u32 frames;
+	struct mutex ctl_lock;	/* ctl_* below and ISP API access */
+	bool ctl_ready;		/* the 3A accepts API calls (after the bin) */
+	u32 ctl_mask;		/* values waiting for ctl_ready */
+	s32 ctl_val[OSM_CTRL_NUM];
 	int inits;		/* IMPL_Init calls done: 0..4 */
 };
 
@@ -242,6 +246,10 @@ static int pipe_start(void *priv, u32 width, u32 height, u32 fps)
 	p->vpe = (struct chn_port){ MOD_VPE, 0, 0, 0 };
 	p->isp_done = false;
 	p->frames = 0;
+	mutex_lock(&p->ctl_lock);
+	p->ctl_ready = false;
+	p->ctl_mask = 0;
+	mutex_unlock(&p->ctl_lock);
 
 	/* what the MI device layer does when a process opens the devices */
 	if (!p->inits) {
@@ -338,6 +346,9 @@ static void pipe_stop(void *priv)
 {
 	struct pipe *p = priv;
 
+	mutex_lock(&p->ctl_lock);
+	p->ctl_ready = false;
+	mutex_unlock(&p->ctl_lock);
 	mutex_lock(&p->lock);
 	if (p->up)
 		pipe_down(p);
@@ -381,6 +392,8 @@ static int copy_plane(const u8 *bi, int plane, void *dst, u32 w, u32 rows)
 	}
 	return -EINVAL;
 }
+
+static void ctl_replay(struct pipe *p);
 
 static int pipe_read_frame(void *priv, void *dst, u32 size, u64 *ts_ns)
 {
@@ -434,8 +447,189 @@ static int pipe_read_frame(void *priv, void *dst, u32 size, u64 *ts_ns)
 		if (r)
 			pr_warn("osm_pipe: ISP bin %s: %d\n", isp_bin, r);
 	}
+	if (!ret && p->frames && !p->ctl_ready)
+		ctl_replay(p);
 out:
 	kfree(info);
+	return ret;
+}
+
+
+/*
+ * Image controls: the 3A of mhal (kernel AE) is driven over the ISP API
+ * (MHalIspApiGet/Set, structs of libmi_isp's MI_ISP_AE_*, ids 0x14xx).
+ * Layouts and enums decoded from the vendor code and checked on the stream:
+ *   0x1404 ExpoMode  u32: 0 auto, 2 gain fixed (shutter auto), 3 shutter
+ *                    fixed (gain auto), 4 manual (1 behaves like 0)
+ *   0x1405 ManualExpo {fn_x10, sensor gain, isp gain, shutter us}; used by
+ *                    the fixed modes, gains 1024 = 1.0x
+ *   0x1409 ExposureLimit {min us, max us, min fn, max fn, min sensor gain,
+ *                    min isp gain, max sensor gain, max isp gain}
+ *   0x1403 EVComp    {ev, grid 1..20}: bias ev / grid in vendor units
+ *   0x140e Flicker   u32: 0 off, 1 60 Hz, 2 50 Hz, 3 auto
+ *   0x1402 ExpoInfo  (read only, 0x23c bytes): u32 stable, at-limit, then
+ *                    {fn_x10, sensor gain, isp gain, us} of the long frame
+ */
+#define API_EXPO_INFO		0x1402
+#define API_EV_COMP		0x1403
+#define API_EXPO_MODE		0x1404
+#define API_MANUAL_EXPO		0x1405
+#define API_EXPO_LIMIT		0x1409
+#define API_FLICKER		0x140e
+#define EXPO_INFO_SIZE		0x23c
+#define BIAS_GRID		2
+#define BIAS_MEV_PER_EV		(1000 / BIAS_GRID)
+
+static const u32 expo_mode_hw[] = {
+	[OSM_EXPO_AUTO] = 0, [OSM_EXPO_GAIN] = 2,
+	[OSM_EXPO_SHUTTER] = 3, [OSM_EXPO_MANUAL] = 4,
+};
+static const u32 flicker_hw[] = {
+	[OSM_FLICKER_OFF] = 0, [OSM_FLICKER_50HZ] = 2,
+	[OSM_FLICKER_60HZ] = 1, [OSM_FLICKER_AUTO] = 3,
+};
+
+static int api_get(u32 id, u32 size, void *buf)
+{
+	int r = osm_isp_api_get(0, id, size, buf);
+
+	return r ? -EIO : 0;
+}
+
+static int api_set(u32 id, u32 size, void *buf)
+{
+	int r = osm_isp_api_set(0, id, size, buf);
+
+	return r ? -EIO : 0;
+}
+
+static int manual_field(u32 field, u32 lo_idx, u32 hi_idx, u32 val)
+{
+	u32 lim[8], man[4];
+	int ret = api_get(API_EXPO_LIMIT, sizeof(lim), lim);
+
+	if (!ret)
+		ret = api_get(API_MANUAL_EXPO, sizeof(man), man);
+	if (ret)
+		return ret;
+	man[field] = clamp(val, lim[lo_idx], lim[hi_idx]);
+	return api_set(API_MANUAL_EXPO, sizeof(man), man);
+}
+
+/* ctl_lock held, 3A up */
+static int ctl_write(u32 id, s32 val)
+{
+	u32 w[2];
+
+	switch (id) {
+	case OSM_CTRL_EXPO_MODE:
+		if (val < 0 || val >= ARRAY_SIZE(expo_mode_hw))
+			return -EINVAL;
+		w[0] = expo_mode_hw[val];
+		return api_set(API_EXPO_MODE, 4, w);
+	case OSM_CTRL_EXPO_US:
+		return manual_field(3, 0, 1, max(val, 0));
+	case OSM_CTRL_GAIN:
+		return manual_field(1, 4, 6, max(val, 0));
+	case OSM_CTRL_BIAS:
+		w[0] = DIV_ROUND_CLOSEST(val, BIAS_MEV_PER_EV);
+		w[1] = BIAS_GRID;
+		return api_set(API_EV_COMP, 8, w);
+	case OSM_CTRL_FLICKER:
+		if (val < 0 || val >= ARRAY_SIZE(flicker_hw))
+			return -EINVAL;
+		w[0] = flicker_hw[val];
+		return api_set(API_FLICKER, 4, w);
+	}
+	return -EINVAL;
+}
+
+/* the first frame is out and the bin is applied: apply what was set before */
+static void ctl_replay(struct pipe *p)
+{
+	/* values first, the mode last */
+	static const u8 order[] = { OSM_CTRL_EXPO_US, OSM_CTRL_GAIN, OSM_CTRL_BIAS,
+				    OSM_CTRL_FLICKER, OSM_CTRL_EXPO_MODE };
+	int i;
+
+	mutex_lock(&p->ctl_lock);
+	p->ctl_ready = true;
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		if (!(p->ctl_mask & BIT(order[i])))
+			continue;
+		if (ctl_write(order[i], p->ctl_val[order[i]]))
+			pr_warn("osm_pipe: control %u not applied\n", order[i]);
+	}
+	p->ctl_mask = 0;
+	mutex_unlock(&p->ctl_lock);
+}
+
+static int pipe_set_ctrl(void *priv, enum osm_ctrl id, s32 val)
+{
+	struct pipe *p = priv;
+	int ret;
+
+	if (id >= OSM_CTRL_NUM)
+		return -EINVAL;
+	mutex_lock(&p->ctl_lock);
+	if (p->ctl_ready) {
+		ret = ctl_write(id, val);
+	} else {
+		p->ctl_val[id] = val;
+		p->ctl_mask |= BIT(id);
+		ret = 0;
+	}
+	mutex_unlock(&p->ctl_lock);
+	return ret;
+}
+
+static int pipe_get_ctrl(void *priv, enum osm_ctrl id, s32 *val)
+{
+	struct pipe *p = priv;
+	u32 w[EXPO_INFO_SIZE / 4];
+	int ret, i;
+
+	mutex_lock(&p->ctl_lock);
+	if (!p->ctl_ready) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	switch (id) {
+	case OSM_CTRL_EXPO_MODE:
+		ret = api_get(API_EXPO_MODE, 4, w);
+		if (ret)
+			break;
+		for (i = 0; i < ARRAY_SIZE(expo_mode_hw); i++)
+			if (expo_mode_hw[i] == w[0])
+				break;
+		/* 1 is an alias of 0 */
+		*val = i < ARRAY_SIZE(expo_mode_hw) ? i : OSM_EXPO_AUTO;
+		break;
+	case OSM_CTRL_EXPO_US:
+	case OSM_CTRL_GAIN:
+		ret = api_get(API_EXPO_INFO, sizeof(w), w);
+		if (!ret)
+			*val = id == OSM_CTRL_GAIN ? w[3] : w[5];
+		break;
+	case OSM_CTRL_BIAS:
+		ret = api_get(API_EV_COMP, 8, w);
+		if (!ret)
+			*val = (s32)w[0] * 1000 / (w[1] ? (s32)w[1] : 1);
+		break;
+	case OSM_CTRL_FLICKER:
+		ret = api_get(API_FLICKER, 4, w);
+		if (ret)
+			break;
+		for (i = 0; i < ARRAY_SIZE(flicker_hw); i++)
+			if (flicker_hw[i] == w[0])
+				break;
+		*val = i < ARRAY_SIZE(flicker_hw) ? i : OSM_FLICKER_OFF;
+		break;
+	default:
+		ret = -EINVAL;
+	}
+out:
+	mutex_unlock(&p->ctl_lock);
 	return ret;
 }
 
@@ -445,6 +639,8 @@ static const struct osm_v4l2_backend pipe_be = {
 	.start = pipe_start,
 	.stop = pipe_stop,
 	.read_frame = pipe_read_frame,
+	.set_ctrl = pipe_set_ctrl,
+	.get_ctrl = pipe_get_ctrl,
 };
 
 static struct osm_v4l2_backend be;
@@ -452,6 +648,7 @@ static struct osm_v4l2_backend be;
 static int __init osm_pipe_init(void)
 {
 	mutex_init(&pipe_state.lock);
+	mutex_init(&pipe_state.ctl_lock);
 	be = pipe_be;
 	be.owner = THIS_MODULE;
 	return osm_v4l2_register(&be);

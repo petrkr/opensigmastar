@@ -17,6 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-fh.h>
@@ -44,6 +45,9 @@ struct osm_dev {
 	struct v4l2_device v4l2;
 	struct video_device vdev;
 	struct vb2_queue q;
+	struct v4l2_ctrl_handler hdl;
+	struct v4l2_ctrl *c_auto, *c_exp, *c_gain, *c_bias, *c_plf;
+	s32 exp_set, gain_set;	/* values for the fixed modes, 100 us / 1024 = 1x */
 	struct mutex lock;		/* ioctls, queue */
 	struct mutex be_lock;		/* backend (un)registration */
 	const struct osm_v4l2_backend *be;
@@ -145,6 +149,185 @@ static void osm_return_bufs(struct osm_dev *d, enum vb2_buffer_state st)
 	spin_unlock_irqrestore(&d->qlock, flags);
 }
 
+
+/*
+ * Image controls. Exposure: V4L2 exposure time is in 100 us, the gain is
+ * the sensor gain with 1024 = 1.0x (V4L2 leaves the unit open). The
+ * auto cluster (mode, time, gain) is volatile: time and gain read back what
+ * the AE chose. Bias is an integer menu in nominal milli-EV (the vendor
+ * scale is not calibrated in stops, see osm_pipe.c).
+ */
+#define OSM_EXP_UNIT_US		100
+#define OSM_GAIN_MIN		1024
+#define OSM_GAIN_MAX		(128 * 1024)
+#define OSM_EXP_MIN		1
+#define OSM_EXP_MAX		1000
+
+static const s64 osm_bias_menu[] = {
+	-3000, -2500, -2000, -1500, -1000, -500, 0,
+	500, 1000, 1500, 2000, 2500, 3000,
+};
+#define OSM_BIAS_DEF		6
+
+static const u8 expo_to_osm[] = {
+	[V4L2_EXPOSURE_AUTO] = OSM_EXPO_AUTO,
+	[V4L2_EXPOSURE_MANUAL] = OSM_EXPO_MANUAL,
+	[V4L2_EXPOSURE_SHUTTER_PRIORITY] = OSM_EXPO_SHUTTER,
+	[V4L2_EXPOSURE_APERTURE_PRIORITY] = OSM_EXPO_GAIN,
+};
+
+static const u8 plf_to_osm[] = {
+	[V4L2_CID_POWER_LINE_FREQUENCY_DISABLED] = OSM_FLICKER_OFF,
+	[V4L2_CID_POWER_LINE_FREQUENCY_50HZ] = OSM_FLICKER_50HZ,
+	[V4L2_CID_POWER_LINE_FREQUENCY_60HZ] = OSM_FLICKER_60HZ,
+	[V4L2_CID_POWER_LINE_FREQUENCY_AUTO] = OSM_FLICKER_AUTO,
+};
+
+/*
+ * Apply the exposure cluster. The values are only used by the fixed modes
+ * (manual: both, shutter priority: the time, aperture priority: the
+ * gain), the AE keeps the rest. Switching to manual freezes what the AE
+ * chose unless the same request carries a value; the mode goes last.
+ */
+static int osm_set_expo(struct osm_dev *d, s32 mode, bool mode_new,
+			bool exp_new, bool gain_new)
+{
+	const struct osm_v4l2_backend *be = d->be;
+	bool use_exp = mode == V4L2_EXPOSURE_MANUAL || mode == V4L2_EXPOSURE_SHUTTER_PRIORITY;
+	bool use_gain = mode == V4L2_EXPOSURE_MANUAL || mode == V4L2_EXPOSURE_APERTURE_PRIORITY;
+	s32 v;
+	int ret = 0;
+
+	if (exp_new)
+		d->exp_set = d->c_exp->val;
+	if (gain_new)
+		d->gain_set = d->c_gain->val;
+	if (mode == V4L2_EXPOSURE_MANUAL && mode_new) {
+		if (!exp_new && !be->get_ctrl(be->priv, OSM_CTRL_EXPO_US, &v))
+			d->exp_set = clamp(DIV_ROUND_CLOSEST(v, OSM_EXP_UNIT_US),
+					   OSM_EXP_MIN, OSM_EXP_MAX);
+		if (!gain_new && !be->get_ctrl(be->priv, OSM_CTRL_GAIN, &v))
+			d->gain_set = clamp(v, OSM_GAIN_MIN, OSM_GAIN_MAX);
+	}
+	if (use_exp && (exp_new || mode_new))
+		ret = be->set_ctrl(be->priv, OSM_CTRL_EXPO_US, d->exp_set * OSM_EXP_UNIT_US);
+	if (!ret && use_gain && (gain_new || mode_new))
+		ret = be->set_ctrl(be->priv, OSM_CTRL_GAIN, d->gain_set);
+	if (!ret && mode_new)
+		ret = be->set_ctrl(be->priv, OSM_CTRL_EXPO_MODE, expo_to_osm[mode]);
+	return ret;
+}
+
+static int osm_s_ctrl(struct v4l2_ctrl *c)
+{
+	struct osm_dev *d = container_of(c->handler, struct osm_dev, hdl);
+	const struct osm_v4l2_backend *be = d->be;
+	int ret = -EINVAL;
+
+	/* the handler has its own lock; be_lock orders this against start/stop */
+	mutex_lock(&d->be_lock);
+	if (!d->thread) {
+		/* not streaming: osm_replay_ctrls() applies the values at the start */
+		if (c->id == V4L2_CID_EXPOSURE_AUTO) {
+			if (d->c_exp->is_new)
+				d->exp_set = d->c_exp->val;
+			if (d->c_gain->is_new)
+				d->gain_set = d->c_gain->val;
+		}
+		mutex_unlock(&d->be_lock);
+		return 0;
+	}
+	switch (c->id) {
+	case V4L2_CID_EXPOSURE_AUTO:
+		ret = osm_set_expo(d, d->c_auto->val, d->c_auto->is_new,
+				   d->c_exp->is_new, d->c_gain->is_new);
+		break;
+	case V4L2_CID_AUTO_EXPOSURE_BIAS:
+		ret = be->set_ctrl(be->priv, OSM_CTRL_BIAS, osm_bias_menu[c->val]);
+		break;
+	case V4L2_CID_POWER_LINE_FREQUENCY:
+		ret = be->set_ctrl(be->priv, OSM_CTRL_FLICKER, plf_to_osm[c->val]);
+		break;
+	}
+	mutex_unlock(&d->be_lock);
+	return ret;
+}
+
+static int osm_g_volatile_ctrl(struct v4l2_ctrl *c)
+{
+	struct osm_dev *d = container_of(c->handler, struct osm_dev, hdl);
+	const struct osm_v4l2_backend *be = d->be;
+	s32 us, gain;
+	int ret;
+
+	mutex_lock(&d->be_lock);
+	if (!d->thread) {
+		mutex_unlock(&d->be_lock);
+		return 0;	/* keep the stored values */
+	}
+	ret = be->get_ctrl(be->priv, OSM_CTRL_EXPO_US, &us);
+	if (!ret)
+		ret = be->get_ctrl(be->priv, OSM_CTRL_GAIN, &gain);
+	mutex_unlock(&d->be_lock);
+	if (ret)
+		return 0;
+	d->c_exp->val = clamp(DIV_ROUND_CLOSEST(us, OSM_EXP_UNIT_US),
+			      OSM_EXP_MIN, OSM_EXP_MAX);
+	d->c_gain->val = clamp(gain, OSM_GAIN_MIN, OSM_GAIN_MAX);
+	return 0;
+}
+
+static const struct v4l2_ctrl_ops osm_ctrl_ops = {
+	.s_ctrl = osm_s_ctrl,
+	.g_volatile_ctrl = osm_g_volatile_ctrl,
+};
+
+/* streaming just started: send what differs from the defaults */
+static void osm_replay_ctrls(struct osm_dev *d)
+{
+	const struct osm_v4l2_backend *be = d->be;
+
+	if (d->c_auto->cur.val != V4L2_EXPOSURE_AUTO)
+		osm_set_expo(d, d->c_auto->cur.val, true, false, false);
+	if (d->c_bias->cur.val != OSM_BIAS_DEF)
+		be->set_ctrl(be->priv, OSM_CTRL_BIAS, osm_bias_menu[d->c_bias->cur.val]);
+	if (d->c_plf->cur.val != V4L2_CID_POWER_LINE_FREQUENCY_50HZ)
+		be->set_ctrl(be->priv, OSM_CTRL_FLICKER, plf_to_osm[d->c_plf->cur.val]);
+}
+
+static int osm_init_ctrls(struct osm_dev *d)
+{
+	struct v4l2_ctrl_handler *h = &d->hdl;
+
+	v4l2_ctrl_handler_init(h, 5);
+	d->c_auto = v4l2_ctrl_new_std_menu(h, &osm_ctrl_ops, V4L2_CID_EXPOSURE_AUTO,
+					   V4L2_EXPOSURE_APERTURE_PRIORITY, 0,
+					   V4L2_EXPOSURE_AUTO);
+	d->c_exp = v4l2_ctrl_new_std(h, &osm_ctrl_ops, V4L2_CID_EXPOSURE_ABSOLUTE,
+				     OSM_EXP_MIN, OSM_EXP_MAX, 1, 100);
+	d->c_gain = v4l2_ctrl_new_std(h, &osm_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+				      OSM_GAIN_MIN, OSM_GAIN_MAX, 1, OSM_GAIN_MIN);
+	d->c_bias = v4l2_ctrl_new_int_menu(h, &osm_ctrl_ops, V4L2_CID_AUTO_EXPOSURE_BIAS,
+					   ARRAY_SIZE(osm_bias_menu) - 1, OSM_BIAS_DEF,
+					   osm_bias_menu);
+	d->c_plf = v4l2_ctrl_new_std_menu(h, &osm_ctrl_ops, V4L2_CID_POWER_LINE_FREQUENCY,
+					  V4L2_CID_POWER_LINE_FREQUENCY_AUTO, 0,
+					  V4L2_CID_POWER_LINE_FREQUENCY_50HZ);
+	if (h->error)
+		return h->error;
+	/* volatile controls only count as changed with execute-on-write */
+	d->c_exp->flags |= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE;
+	d->c_gain->flags |= V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE;
+	/*
+	 * One cluster, but not an auto cluster: the core would refuse the
+	 * values outside manual mode, and the priority modes need them.
+	 */
+	v4l2_ctrl_cluster(3, &d->c_auto);
+	d->exp_set = d->c_exp->default_value;
+	d->gain_set = d->c_gain->default_value;
+	return 0;
+}
+
 static int osm_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct osm_dev *d = vb2_get_drv_priv(q);
@@ -158,6 +341,7 @@ static int osm_start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = d->be->start(d->be->priv, OSM_WIDTH, OSM_HEIGHT, OSM_FPS);
 	if (ret)
 		goto put;
+	osm_replay_ctrls(d);
 	d->sequence = 0;
 	d->thread = kthread_run(osm_thread, d, "osm_v4l2");
 	if (IS_ERR(d->thread)) {
@@ -378,6 +562,10 @@ static int __init osm_v4l2_init(void)
 	if (ret)
 		goto err_pdev;
 
+	ret = osm_init_ctrls(d);
+	if (ret)
+		goto err_ctrls;
+
 	q = &d->q;
 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	q->io_modes = VB2_MMAP | VB2_READ | VB2_USERPTR | VB2_DMABUF;
@@ -398,6 +586,7 @@ static int __init osm_v4l2_init(void)
 	d->vdev.ioctl_ops = &osm_ioctl_ops;
 	d->vdev.release = video_device_release_empty;
 	d->vdev.v4l2_dev = &d->v4l2;
+	d->vdev.ctrl_handler = &d->hdl;
 	d->vdev.queue = q;
 	d->vdev.lock = &d->lock;
 	d->vdev.vfl_dir = VFL_DIR_RX;
@@ -412,6 +601,8 @@ static int __init osm_v4l2_init(void)
 	pr_info("osm_v4l2: /dev/video%d\n", d->vdev.num);
 	return 0;
 err_v4l2:
+	v4l2_ctrl_handler_free(&d->hdl);
+err_ctrls:
 	v4l2_device_unregister(&d->v4l2);
 err_pdev:
 	platform_device_unregister(d->pdev);
@@ -426,6 +617,7 @@ static void __exit osm_v4l2_exit(void)
 
 	odev = NULL;
 	video_unregister_device(&d->vdev);
+	v4l2_ctrl_handler_free(&d->hdl);
 	v4l2_device_unregister(&d->v4l2);
 	platform_device_unregister(d->pdev);
 	kfree(d);

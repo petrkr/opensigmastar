@@ -5,6 +5,35 @@
 #include <linux/types.h>
 
 /*
+ * Image controls of the backend (3A of the kernel ISP). Units are the
+ * backend's own, not V4L2's: exposure in us, gain as a fixed-point
+ * multiplier with 1024 = 1.0x, bias in nominal milli-EV (see osm_pipe.c),
+ * flicker as a mode. Values are accepted only while the pipeline runs.
+ */
+enum osm_ctrl {
+	OSM_CTRL_EXPO_MODE,	/* enum osm_expo_mode */
+	OSM_CTRL_EXPO_US,	/* shutter time used by the fixed-shutter modes */
+	OSM_CTRL_GAIN,		/* sensor gain used by the fixed-gain modes */
+	OSM_CTRL_BIAS,		/* auto exposure bias, milli-EV */
+	OSM_CTRL_FLICKER,	/* enum osm_flicker */
+	OSM_CTRL_NUM
+};
+
+enum osm_expo_mode {
+	OSM_EXPO_AUTO,		/* shutter and gain automatic */
+	OSM_EXPO_SHUTTER,	/* shutter fixed, gain automatic */
+	OSM_EXPO_GAIN,		/* gain fixed, shutter automatic */
+	OSM_EXPO_MANUAL,	/* both fixed */
+};
+
+enum osm_flicker {
+	OSM_FLICKER_OFF,	/* no avoidance, shutter not quantized */
+	OSM_FLICKER_50HZ,
+	OSM_FLICKER_60HZ,
+	OSM_FLICKER_AUTO,
+};
+
+/*
  * Backend of the osm_v4l2 capture device (osm_pipe.ko registers one).
  * Split in two modules because a module that uses symbols of the
  * proprietary vendor modules cannot use GPL-only symbols (V4L2, vb2), and
@@ -27,6 +56,14 @@ struct osm_v4l2_backend {
 	 * a backend using vendor symbols cannot call ktime_get()).
 	 */
 	int (*read_frame)(void *priv, void *dst, u32 size, u64 *ts_ns);
+	/*
+	 * Image controls. set_ctrl may be called right after start(): the
+	 * backend keeps the value until the 3A accepts it. get_ctrl returns
+	 * the value in effect (EXPO_US/GAIN: the current exposure) or
+	 * -EAGAIN while the 3A is not up yet.
+	 */
+	int (*set_ctrl)(void *priv, enum osm_ctrl id, s32 val);
+	int (*get_ctrl)(void *priv, enum osm_ctrl id, s32 *val);
 };
 
 int osm_v4l2_register(const struct osm_v4l2_backend *be);

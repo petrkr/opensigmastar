@@ -20,6 +20,10 @@
 #             needs the in-tree media modules in the module dir and
 #             $FW/imx415.bin, default 0). Do not run a userspace MI
 #             application at the same time.
+#        CMDQ = vendor (default) | shim | own: must match the CMDQ= the
+#             modules were built with (osm-build, make CMDQ=); shim and own
+#             load osm_cmdq (after mhal / before mhal), CMDQ_ARGS = its
+#             module parameters
 #        ISPBIN = ISP tuning bin for V4L2=1, relative to /lib/firmware
 #             (default sstar/imx415.bin, empty = none)
 
@@ -45,7 +49,13 @@ loadonce() {
 
 load osm_compat
 load osm_sstar mma_heap=mma_heap_name0,miu=0,sz=0x9E9C000
+case ${CMDQ:-vendor} in
+vendor | shim) ;;
+own) load osm_cmdq $CMDQ_ARGS ;;
+*) die "CMDQ must be vendor, shim or own" ;;
+esac
 load mhal drv_venc_wrapper.fw_load_path="$FW/chagall.bin"
+[ "${CMDQ:-vendor}" = shim ] && load osm_cmdq $CMDQ_ARGS
 load mi_common
 load mi_sys cmdQBufSize=768 logBufSize=256 bEnableMmu=0
 # no mi_ai/mi_ao: replaced by ALSA, see README

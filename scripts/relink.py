@@ -279,6 +279,11 @@ def main():
     ap.add_argument('--symvers', help='kernel Module.symvers, its exports are not re-exported')
     ap.add_argument('--extra-exports', help='file: "<module> <fnmatch pattern>" lines, '
                     'defined symbols of the blob to export in addition to its own exports')
+    ap.add_argument('--cmdq', choices=('vendor', 'shim', 'own'), default='vendor',
+                    help='mhal only: keep the blob CMDQ implementation (vendor), '
+                    'rename its MHAL_CMDQ_* exports to __vendor_MHAL_CMDQ_* for '
+                    'the osm_cmdq shim (shim), or make them undefined so that '
+                    'osm_cmdq provides them (own)')
     ap.add_argument('--objcopy', default=os.environ.get('CROSS_COMPILE', '') + 'objcopy')
     a = ap.parse_args()
 
@@ -304,6 +309,20 @@ def main():
         sys.exit('no init_module in %s' % a.ko)
     has_exit = 'cleanup_module' in names
     elf.undefine('__this_module')
+    cmdq_rename = []
+    if a.name == 'mhal' and a.cmdq != 'vendor':
+        # the exported MHAL_CMDQ_* entry points: nothing below them is called
+        # from outside the CMDQ code (checked on the relocations)
+        cmdq = [s for s in exports if s.startswith('MHAL_CMDQ_')]
+        if not cmdq:
+            sys.exit('no MHAL_CMDQ_* exports in %s' % a.ko)
+        if a.cmdq == 'shim':
+            cmdq_rename = ['__vendor_' + s for s in cmdq]
+            exports = [('__vendor_' + s if s in cmdq else s) for s in exports]
+        else:
+            for s in cmdq:
+                elf.undefine(s)
+            exports = [s for s in exports if s not in cmdq]
     license = modinfo(elf, 'license') or 'Proprietary'
     desc = modinfo(elf, 'description') or '%s (vendor module)' % a.name
 
@@ -323,6 +342,8 @@ def main():
         for pre in ('', '.ARM.exidx'):
             if pre + sec in elf.names:
                 cmd += ['--rename-section', '%s%s=%s.text.osm%s' % (pre, sec, pre, sec[:5])]
+    for n in cmdq_rename:
+        cmd += ['--redefine-sym', '%s=%s' % (n[len('__vendor_'):], n)]
     cmd += ['--redefine-sym', 'init_module=osm_%s_blob_init' % a.name]
     if has_exit:
         cmd += ['--redefine-sym', 'cleanup_module=osm_%s_blob_exit' % a.name]

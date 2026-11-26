@@ -5,3 +5,6 @@ ccflags-y += -I$(src)/include -I$(src)/include/i6e -I$(src)/../compat -Wno-sync-
 obj-m += osm_sstar.o
 osm_sstar-y := main.o chip.o msys.o cam_sysfs.o mma.o msys_dma.o cam_clk.o board.o cam_fs.o miu/mdrv_miu.o miu/mhal_miu.o \
 	cam_os_wrapper/cam_os_wrapper.o cam_os_wrapper/cam_os_export.o
+
+# needs mhal (MHalIspApiSet), loaded after it
+obj-m += osm_isp.o

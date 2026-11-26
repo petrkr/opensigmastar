@@ -12,6 +12,9 @@
 # usage: osm-load.sh [module dir]   (default: current dir)
 # env:   FW = firmware dir (default /lib/firmware/sstar: chagall.bin,
 #             iqfile0.bin)
+#        SENSOR = vendor (default, sensor_imx415_mipi.ko) or mainline
+#             (mainline imx415.ko + osm_snr_v4l2.ko proxy plug-in, needs the
+#             in-tree media modules and imx415 in the module dir)
 
 D=${1:-.}
 FW=${FW:-/lib/firmware/sstar}
@@ -25,6 +28,12 @@ load() {
 	n=$1
 	shift
 	insmod "$D/$n.ko" "$@" || die "insmod $n failed"
+}
+
+# load unless already there (media modules shared by SENSOR=mainline, V4L2=1)
+loadonce() {
+	m=$(echo "$1" | tr - _)
+	grep -q "^$m " /proc/modules || load "$@"
 }
 
 load osm_compat
@@ -47,4 +56,16 @@ if [ ! -e /dev/mi_poll ]; then
 fi
 
 echo isproot "$FW" >/dev/ispmid || die "cannot set isproot"
-load sensor_imx415_mipi chmap=1
+case ${SENSOR:-vendor} in
+vendor) load sensor_imx415_mipi chmap=1 ;;
+mainline)
+	for n in mc videodev v4l2-async v4l2-fwnode v4l2-cci; do
+		loadonce $n
+	done
+	# the plug-in releases the sensor reset/PDN pins (VIF sensor
+	# interface), so it must come before imx415, which probes the sensor
+	load osm_snr_v4l2 chmap=1
+	load imx415
+	;;
+*) die "SENSOR must be vendor or mainline" ;;
+esac

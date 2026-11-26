@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0
+# Sensor plug-ins for the vendor mhal sensor registry
+ccflags-y += -I$(src)/../compat
+
+# proxy plug-in: drives the mainline imx415 V4L2 sub-device (SENSOR=mainline)
+obj-m += osm_snr_v4l2.o

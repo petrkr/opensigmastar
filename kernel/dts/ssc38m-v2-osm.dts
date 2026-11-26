@@ -6,3 +6,27 @@
 #include "sigmastar/mstar-infinity6e-ssc338q-ssc38m-v2.dts"
 #include "sstar-video.dtsi"
 #include "osm-compat.dtsi"
+
+/*
+ * Image sensor for the mainline imx415 driver, used by the osm_snr_v4l2 mhal
+ * plug-in (SENSOR=mainline). Not for the mainline board DTS: the supplies
+ * are fixed rails without regulator nodes, the reset and power-down pins are
+ * driven by the sensor interface of the video input block (not a GPIO) and
+ * there is no CSI receiver node to link the endpoint to.
+ */
+&i2c1 {
+	imx415: camera@1a {
+		compatible = "sony,imx415";
+		reg = <0x1a>;
+		clocks = <&clkgen SSC338Q_CLKGEN_SR00_MCLK>;
+		assigned-clocks = <&clkgen SSC338Q_CLKGEN_SR00_MCLK>;
+		assigned-clock-rates = <27000000>;
+
+		port {
+			imx415_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <445500000>;
+			};
+		};
+	};
+};

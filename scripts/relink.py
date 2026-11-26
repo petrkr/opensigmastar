@@ -31,6 +31,29 @@ SHN_UNDEF = 0
 SHT_SYMTAB = 2
 SHT_REL = 9
 
+# mhal VIF/CSI cut (--vif): the 22 MHal_VIF_* imports of mi_vif/mi_vpe and the
+# internal entry points that the sensor, ISP and ISRCB code of mhal call (checked
+# on the relocations of mhal.ko, kernel/blobs/mhal_vif_*.c has the prototypes)
+VIF_CUT = (
+    'MHal_VIF_ChnDisable', 'MHal_VIF_ChnEnable', 'MHal_VIF_ChnQuery',
+    'MHal_VIF_ChnReset', 'MHal_VIF_ChnSetConfig', 'MHal_VIF_Deinit',
+    'MHal_VIF_DequeueFrameBuffer', 'MHal_VIF_DevDisable', 'MHal_VIF_DevEnable',
+    'MHal_VIF_DevSetConfig', 'MHal_VIF_GetInputMask',
+    'MHal_VIF_GetVIFDev2SensorPadMux', 'MHal_VIF_Init', 'MHal_VIF_InputMask',
+    'MHal_VIF_QueryFrames', 'MHal_VIF_QueueFrameBuffer',
+    'MHal_VIF_RegisterEventCallback', 'MHal_VIF_RegisterGetPtsCallback',
+    'MHal_VIF_SetVIFDev2SensorPadMux', 'MHal_VIF_StopMCU',
+    'MHal_VIF_SubChnQuery', 'MHal_Vif_GetSensorFrmCnt64',
+    'DrvVif_ChnID2DevID', 'DrvVif_Dev2ChnID', 'DrvVif_GetDev2SNRPadID',
+    'DrvVif_GetSensorFrmCnt64', 'DrvVif_Init', 'DrvVif_InputMask',
+    'DrvVif_InputMaskFrameSync', 'DrvVif_QueryMCLK', 'DrvVif_SNRPad2DevID',
+    'DrvVif_SensorPdwn', 'DrvVif_SensorReset', 'DrvVif_SetDev2SNRPadMap',
+    'DrvVif_SetLineCntHit_MaskChange', 'DrvVif_SetMclk',
+    'DrvVif_SetSelectSource', 'DrvVif_SetIOPad',
+    'Drv_CSIQueryLaneNum', 'Drv_CSISetClk', 'Drv_CSISetHDRMode',
+    'Drv_CSISetLane', 'Drv_CSISetClkDataSkip', 'Drv_CSISetLongPacket',
+)
+
 REMOVE = ('.gnu.linkonce.this_module', '.modinfo', '__versions',
           '__ksymtab', '__ksymtab_gpl', '__ksymtab_strings', '.pv_table')
 
@@ -286,6 +309,12 @@ def main():
                     'the blob code gets the aliases __vendor_MHAL_CMDQ_*, '
                     'kernel/blobs/mhal_cmdq_shim.c defines them; own: they '
                     'become undefined and osm_cmdq provides them')
+    ap.add_argument('--vif', choices=('vendor', 'shim', 'own'), default='vendor',
+                    help='mhal only: keep the blob VIF/CSI implementation (vendor); '
+                    'shim: the VIF_CUT entry points become undefined and the blob '
+                    'code gets the aliases __vendor_<name>, kernel/blobs/'
+                    'mhal_vif_shim.c defines them and forwards; own: undefined, '
+                    'kernel/blobs/mhal_vif_own.c implements them')
     ap.add_argument('--objcopy', default=os.environ.get('CROSS_COMPILE', '') + 'objcopy')
     a = ap.parse_args()
 
@@ -326,6 +355,16 @@ def main():
         for s in cmdq:
             elf.undefine(s)
         exports = [s for s in exports if s not in cmdq]
+    if a.name == 'mhal' and a.vif != 'vendor':
+        defined = {n: (ndx, v) for _, n, v, _, _, ndx in elf.symbols() if ndx != SHN_UNDEF}
+        for s in VIF_CUT:
+            if s not in defined:
+                sys.exit('%s: no %s' % (a.ko, s))
+            if a.vif == 'shim':
+                cmdq_rename.append('__vendor_%s=%s:%#x,global,function' %
+                                   (s, elf.names[defined[s][0]], defined[s][1]))
+            elf.undefine(s)
+        exports = [s for s in exports if s not in VIF_CUT]
     license = modinfo(elf, 'license') or 'Proprietary'
     desc = modinfo(elf, 'description') or '%s (vendor module)' % a.name
 

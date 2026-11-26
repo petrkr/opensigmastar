@@ -14,3 +14,11 @@ $(foreach b,$(OSM_BLOBS),$(eval $(call osm_blob,$(b))))
 ifeq ($(OSM_CMDQ),shim)
 mhal-y += mhal_cmdq_shim.o
 endif
+
+# mhal VIF/CSI shim / own implementation (make VIF=shim|own, scripts/relink.py --vif)
+ifeq ($(OSM_VIF),shim)
+mhal-y += mhal_vif_shim.o
+endif
+ifeq ($(OSM_VIF),own)
+mhal-y += mhal_vif_own.o
+endif

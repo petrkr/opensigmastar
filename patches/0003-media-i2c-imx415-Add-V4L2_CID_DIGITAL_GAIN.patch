@@ -1,0 +1,100 @@
+From: opensigmastar
+Subject: [PATCH] media: i2c: imx415: Add V4L2_CID_DIGITAL_GAIN
+
+The sensor has a single gain register, GAIN_PCG_0 (0x3090), with
+a range of 0 to 240 in 0.3 dB steps (datasheet: single GAIN_PCG_0
+register, 0-30 dB analog, 30.3-72 dB analog 30 dB + digital). There is
+no separate digital gain register, the sensor splits the total itself.
+The driver only exposes V4L2_CID_ANALOGUE_GAIN (0..100, 0-30 dB), so
+the digital part above 30 dB cannot be used.
+
+Add V4L2_CID_DIGITAL_GAIN (0..140, 0-42 dB in 0.3 dB steps). It is
+applied on top of the full analogue gain: a non-zero value programs
+100 + digital gain, ANALOGUE_GAIN is ignored while it is non-zero
+(it keeps its value, it is not rewritten). Zero programs the analogue
+gain only. Both controls form one cluster so the register is written
+atomically. The default of 0 keeps the behaviour for existing users.
+
+---
+--- a/drivers/media/i2c/imx415.c
++++ b/drivers/media/i2c/imx415.c
+@@ -64,6 +64,9 @@
+ #define IMX415_AGAIN_MIN	  0
+ #define IMX415_AGAIN_MAX	  100
+ #define IMX415_AGAIN_STEP	  1
++#define IMX415_DGAIN_MIN	  0
++#define IMX415_DGAIN_MAX	  140
++#define IMX415_DGAIN_STEP	  1
+ #define IMX415_BLKLEVEL		  CCI_REG16_LE(0x30e2)
+ #define IMX415_BLKLEVEL_DEFAULT	  50
+ #define IMX415_TPG_EN_DUOUT	  CCI_REG8(0x30e4)
+@@ -565,6 +568,9 @@
+ 	struct v4l2_ctrl *hflip;
+ 	struct v4l2_ctrl *vflip;
+ 	struct v4l2_ctrl *exposure;
++	/* analogue and digital gain share one register: control cluster */
++	struct v4l2_ctrl *again;
++	struct v4l2_ctrl *dgain;
+ 
+ 	unsigned int cur_mode;
+ 	unsigned int num_data_lanes;
+@@ -741,9 +747,19 @@
+ 		break;
+ 
+ 	case V4L2_CID_ANALOGUE_GAIN:
+-		/* analogue gain in 0.3 dB step size */
++		/*
++		 * GAIN_PCG_0 is the only gain register: 0 to 30 dB is analogue
++		 * gain, 30.3 to 72 dB is analogue 30 dB plus digital gain, in
++		 * 0.3 dB steps. A non-zero digital gain is only valid on top of
++		 * the full analogue gain, so ANALOGUE_GAIN is ignored (and not
++		 * rewritten) while DIGITAL_GAIN is non-zero. This keeps the
++		 * control values as the user set them, and the cluster makes
++		 * the write atomic (s_ctrl is called once, with the first).
++		 */
+ 		ret = cci_write(sensor->regmap, IMX415_GAIN_PCG_0,
+-				ctrl->val, NULL);
++				sensor->dgain->val ?
++				IMX415_AGAIN_MAX + sensor->dgain->val :
++				sensor->again->val, NULL);
+ 		break;
+ 
+ 	case V4L2_CID_HFLIP:
+@@ -795,7 +811,7 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	v4l2_ctrl_handler_init(&sensor->ctrls, 10);
++	v4l2_ctrl_handler_init(&sensor->ctrls, 11);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(link_freq_menu_items); ++i) {
+ 		if (lane_rate == link_freq_menu_items[i] * 2)
+@@ -819,10 +835,16 @@
+ 					     V4L2_CID_EXPOSURE, 4,
+ 					     exposure_max, 1, exposure_max);
+ 
+-	v4l2_ctrl_new_std(&sensor->ctrls, &imx415_ctrl_ops,
+-			  V4L2_CID_ANALOGUE_GAIN, IMX415_AGAIN_MIN,
+-			  IMX415_AGAIN_MAX, IMX415_AGAIN_STEP,
+-			  IMX415_AGAIN_MIN);
++	sensor->again = v4l2_ctrl_new_std(&sensor->ctrls, &imx415_ctrl_ops,
++					  V4L2_CID_ANALOGUE_GAIN,
++					  IMX415_AGAIN_MIN, IMX415_AGAIN_MAX,
++					  IMX415_AGAIN_STEP, IMX415_AGAIN_MIN);
++
++	/* digital gain on top of the full analogue gain, 0.3 dB steps */
++	sensor->dgain = v4l2_ctrl_new_std(&sensor->ctrls, &imx415_ctrl_ops,
++					  V4L2_CID_DIGITAL_GAIN,
++					  IMX415_DGAIN_MIN, IMX415_DGAIN_MAX,
++					  IMX415_DGAIN_STEP, IMX415_DGAIN_MIN);
+ 
+ 	hblank_min = (cur_mode->hmax_min[sensor->num_data_lanes == 2 ? 0 : 1] *
+ 		      IMX415_HMAX_MULTIPLIER) - IMX415_PIXEL_ARRAY_WIDTH;
+@@ -862,6 +884,7 @@
+ 		v4l2_ctrl_handler_free(&sensor->ctrls);
+ 		return sensor->ctrls.error;
+ 	}
++	v4l2_ctrl_cluster(2, &sensor->again);
+ 	sensor->subdev.ctrl_handler = &sensor->ctrls;
+ 
+ 	return 0;

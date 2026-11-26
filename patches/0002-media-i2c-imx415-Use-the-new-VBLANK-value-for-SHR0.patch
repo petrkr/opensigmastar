@@ -1,0 +1,51 @@
+From: opensigmastar
+Subject: [PATCH] media: i2c: imx415: Use the new VBLANK value for SHR0
+
+When V4L2_CID_VBLANK is set, imx415_s_ctrl() writes the new VMAX and then
+falls through to the exposure case to program SHR0 = VMAX - exposure.
+The exposure case computes VMAX from sensor->vblank->cur.val, which still
+holds the old value at this point, because the control core updates
+cur.val only after s_ctrl() has returned. SHR0 is therefore calculated
+for the previous frame length. If the exposure control is not written
+afterwards, SHR0 stays wrong and the actual exposure differs from the
+requested one (for example when the frame rate is changed).
+
+Take the VBLANK value from the control being set instead.
+
+Fixes: 3bcae55ab96a ("media: i2c: imx415: Add read/write control of VBLANK")
+---
+--- a/drivers/media/i2c/imx415.c
++++ b/drivers/media/i2c/imx415.c
+@@ -697,6 +697,7 @@
+ 	struct v4l2_subdev_state *state;
+ 	u32 exposure_max;
+ 	unsigned int vmax;
++	unsigned int vblank;
+ 	unsigned int flip;
+ 	int ret;
+ 
+@@ -715,10 +716,14 @@
+ 	if (!pm_runtime_get_if_in_use(sensor->dev))
+ 		return 0;
+ 
++	vblank = sensor->vblank->cur.val;
++
+ 	switch (ctrl->id) {
+ 	case V4L2_CID_VBLANK:
++		/* cur.val is updated only after s_ctrl returns */
++		vblank = ctrl->val;
+ 		ret = cci_write(sensor->regmap, IMX415_VMAX,
+-				format->height + ctrl->val, NULL);
++				format->height + vblank, NULL);
+ 		if (ret)
+ 			break;
+ 		/*
+@@ -729,7 +734,7 @@
+ 		fallthrough;
+ 	case V4L2_CID_EXPOSURE:
+ 		/* clamp the exposure value to VMAX. */
+-		vmax = format->height + sensor->vblank->cur.val;
++		vmax = format->height + vblank;
+ 		ctrl->val = min_t(int, ctrl->val, vmax);
+ 		ret = cci_write(sensor->regmap, IMX415_SHR0,
+ 				vmax - ctrl->val, NULL);

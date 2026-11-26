@@ -15,6 +15,13 @@
 #        SENSOR = vendor (default, sensor_imx415_mipi.ko) or mainline
 #             (mainline imx415.ko + osm_snr_v4l2.ko proxy plug-in, needs the
 #             in-tree media modules and imx415 in the module dir)
+#        V4L2 = 1: also load the V4L2 capture device (osm_v4l2 + osm_pipe,
+#             /dev/video0, NV12 1920x1080, the pipeline starts on STREAMON;
+#             needs the in-tree media modules in the module dir and
+#             $FW/imx415.bin, default 0). Do not run a userspace MI
+#             application at the same time.
+#        ISPBIN = ISP tuning bin for V4L2=1, relative to /lib/firmware
+#             (default sstar/imx415.bin, empty = none)
 
 D=${1:-.}
 FW=${FW:-/lib/firmware/sstar}
@@ -69,3 +76,13 @@ mainline)
 	;;
 *) die "SENSOR must be vendor or mainline" ;;
 esac
+
+if [ "${V4L2:-0}" = 1 ]; then
+	for n in mc videodev videobuf2-common videobuf2-memops videobuf2-v4l2 \
+		videobuf2-vmalloc; do
+		loadonce $n
+	done
+	load osm_isp
+	load osm_v4l2
+	load osm_pipe isp_bin="${ISPBIN-sstar/imx415.bin}"
+fi

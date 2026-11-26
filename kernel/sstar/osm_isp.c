@@ -225,7 +225,7 @@ out:
 	mutex_unlock(&isp_lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(osm_isp_load_bin);
+EXPORT_SYMBOL(osm_isp_load_bin);
 
 static int load_set(const char *val, const struct kernel_param *kp)
 {

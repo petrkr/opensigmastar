@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+# V4L2 capture device: osm_v4l2 (V4L2/vb2 front, GPL symbols only) and
+# osm_pipe (backend over the vendor MI modules; it uses symbols of the
+# proprietary mhal/mi_* modules, so it must not use GPL-only symbols and
+# must not be a dependency of osm_v4l2).
+ccflags-y += -I$(src)/../compat -I$(src)/../sstar/include -I$(src)/../sstar/include/i6e
+
+obj-m += osm_v4l2.o osm_pipe.o

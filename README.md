@@ -60,6 +60,49 @@ The vendor audio modules `mi_ai` and `mi_ao` are built but not loaded by
 (`sound/soc/sstar/`, Linux tree), which drives the same hardware block.
 Use ALSA instead of the vendor MI_AI/MI_AO API.
 
+## Vendor modules: status
+
+All original vendor modules, with the size of the blob object that is
+relinked. "Loaded as-is" means the closed code runs unmodified on top of
+`osm_compat` (4.9 ABI layer). The `make` options (`CMDQ=`, `VIF=`, `SCL=`,
+`JPE=`, `SENSOR=` for `scripts/osm-load.sh`) are build/load-time switches;
+the default is always the vendor code. "Passes" means the 1080p20 RTSP
+stream, JPEG snapshot, V4L2 capture and auto exposure were checked with
+that option on the camera.
+
+| Module (blob size) | Purpose | Status | Current use |
+|---|---|---|---|
+| `mhal` (1.69 MB) | All hardware drivers: CSI/VIF, ISP + IQ + AE/AWB, scaler, LDC, DIP, GOP, JPE and VENC host, CMDQ, display, audio, sensor registry | Loaded as-is by default; partly replaced via relink cuts (the code stays inside `mhal.ko`): CMDQ (`CMDQ=own`, passes), VIF + CSI (`VIF=own`, passes, 4-lane CSI only), SCL (`SCL=own`, partial: 1080p main port from 4K input passes, JPEG port 1 does not work), JPE (`JPE=shim`, logging shim only, no own implementation committed) | Every stage; ISP, AE/AWB, VENC and JPE stay vendor |
+| `mi_common` (11 KB) | `MI_DEVICE_*` register helper, char device/proc glue | Loaded as-is | Dependency of all `mi_*` |
+| `mi_sys` (479 KB) | Buffer pools, port binding, PTS/FRC, CMDQ service | Loaded as-is | Used by `osm_pipe` (`MI_SYS_*`) and by userspace via ioctl |
+| `mi_sensor` (30 KB) | `MI_SNR_*` over the `MHal_SNR_*` sensor layer | Loaded as-is | Used by `osm_pipe` (`MI_SNR_*`); dependency of `mi_vif`/`mi_vpe` |
+| `sensor_imx415_mipi` (31 KB) | IMX415 plug-in: init tables, gain/shutter, modes | Fully replaced by the mainline `imx415` driver through `osm_snr_v4l2` with `SENSOR=mainline` (3840x2160@20 linear only; passes). Vendor module is the default | Registers into the `mhal` sensor registry |
+| `mi_vif` (76 KB) | `MI_VIF_*` over the VIF/CSI hardware | Loaded as-is; its `MHal_VIF_*` backend can be replaced inside `mhal` (`VIF=own`) | Used by `osm_pipe` (`MI_VIF_*`) |
+| `mi_vpe` (215 KB) | ISP and scaler channel management, `MI_VPE_*IspApiData` | Loaded as-is; scaler backend partly replaceable (`SCL=own`) | Used by `osm_pipe` (`MI_VPE_*`); ISP entry point for the tuning bin |
+| `mi_venc` (217 KB) | H.264/H.265/JPEG channels, rate control, stream ring | Loaded as-is; JPE backend only wrapped by a logging shim (`JPE=shim`) | Used by `osm_pipe` (`MI_VENC_*`, compressed V4L2 node); needs `chagall.bin` |
+| `mi_rgn` (96 KB) | OSD / cover regions (GOP) | Loaded as-is | Not used by the pipeline; loaded only because `mi_vpe` depends on it |
+| `mi_ldc` (620 KB) | Lens distortion correction, DIS, stitching | Loaded as-is | Not used by the pipeline; loaded only because `mi_vpe` depends on it |
+| `mi_divp` (64 KB) | DIP scaler / format conversion | Not loaded: unused by the stream (stream tested without it) | Built only; load it before `mi_vif` if a DIVP feature is needed |
+| `mi_mipitx` (24 KB) | MIPI TX (display output), likely | Not loaded: unused by the stream, no dependents | Built only |
+| `mi_shadow` (48 KB) | Userspace-defined MI modules, likely | Not loaded: unused by the stream (tested) | Built only |
+| `mi_ai` (225 KB) | Audio input | Not loaded: replaced by the mainline ALSA driver (see Audio) | Built only |
+| `mi_ao` (94 KB) | Audio output | Not loaded: replaced by the mainline ALSA driver | Built only |
+
+Our modules:
+
+- `osm_compat`: Linux 4.9 kernel ABI emulation for the vendor modules.
+- `osm_sstar`: vendor support code ported from source (CamOs wrapper, clocks, MIU, memory heap, msys, board GPIO map).
+- `osm_isp`: loader that applies the ISP tuning bin (`imx415.bin`) through the vendor ISP API.
+- `osm_snr_v4l2`: `mhal` sensor plug-in that drives the mainline `imx415` V4L2 sub-device (`SENSOR=mainline`).
+- `osm_cmdq`: driver for the four CMDQ engines behind `MHAL_CMDQ_*` (`CMDQ=own`, loaded before `mhal`).
+- `osm_pipe`: in-kernel sensor, VIF, VPE (ISP + scaler) and VENC pipeline built from the vendor `MI_*` implementation entry points.
+- `osm_v4l2`: V4L2 capture device (NV12 node and H.264/MJPEG node) on top of `osm_pipe`.
+- `mhal_vif_own.c`, `mhal_scl_own.c`: own VIF/CSI and SCL code linked into `mhal.ko` (`VIF=own`, `SCL=own`).
+- `mhal_cmdq_shim.c`, `mhal_vif_shim.c`, `mhal_scl_shim.c`, `mhal_jpe_shim.c`: logging/diagnostic shims linked into `mhal.ko` that forward to the vendor code (`CMDQ=shim`, `VIF=shim`, `SCL=shim`, `JPE=shim`).
+
+The firmware files (`chagall.bin`, `iqfile0.bin`, `imx415.bin`) are data, not
+modules; they are separate from the status above and are still required.
+
 ## Layout
 
 - `kernel/compat/`: compatibility layer that provides the Linux 4.9 kernel
